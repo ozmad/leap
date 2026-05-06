@@ -1563,6 +1563,19 @@ class MonitorWindow(
         """Reset dock badge + tooltip font when window becomes active."""
         super().changeEvent(event)
         if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            # Skip the visible side-effects (badge clear, banner refresh,
+            # tooltip-font reset) when the activation is just a brief
+            # reshuffle while a child dialog is visible — Qt deactivates
+            # the dialog and reactivates the main window momentarily on
+            # certain widget interactions (notably destroying focused
+            # children during a checklist toggle), and running the full
+            # change-event response on every such cycle flashes the main
+            # window visibly to the user.  The dialog regaining focus
+            # fires its own change-event for tooltip-font handling.
+            for w in QApplication.topLevelWidgets():
+                if (isinstance(w, QDialog) and w.isVisible()
+                        and w.parent() is self):
+                    return
             self._clear_dock_badge()
             # Restore the tooltip font to the main-window zoom size
             # (dialogs set it to their size while they're active).
