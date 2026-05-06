@@ -2010,36 +2010,97 @@ class NotesDialog(_NotesFindBarMixin, QDialog):
             return
 
     def _insert_link(self) -> None:
-        """Prompt for a URL and insert it at the cursor (Cmd+K)."""
+        """Prompt for a URL and insert it at the cursor (Cmd+K).
+
+        Coordinator over ``_can_insert_link_at`` →
+        ``_snapshot_selection`` → ``_fallback_line_edit_for`` →
+        ``_prompt_for_url`` → one of three ``_apply_link_to_*``
+        helpers, with ``_commit_add_field_link_if_needed`` handling
+        the special case of links typed into the checklist add-field.
+        """
         focus = QApplication.focusWidget()
-        # Refuse to insert if focus isn't on a note editor — sidebar
-        # search, find input, or no focus at all should not receive
-        # a link.  This prevents URLs landing in the search box when
-        # a checklist popup dismisses during the modal.
-        if not isinstance(focus, (_NoteTextEdit, QTextEdit, QLineEdit)):
+        if not self._can_insert_link_at(focus):
             return
+        selected, sel_start, sel_end = self._snapshot_selection(focus)
+        fallback_line_edit = self._fallback_line_edit_for(focus)
+        url = self._prompt_for_url(focus)
+        if url is None:
+            return  # user cancelled
+
+        # The URL dialog may have caused a checklist popup to dismiss
+        # despite ``_suppress_dismiss`` — route the link into the
+        # underlying line edit rather than losing the edit (or worse,
+        # leaking it into the sidebar search where Qt's next focus
+        # target would be).  Display→raw mapping in
+        # ``_apply_link_to_line_edit`` covers the item-popup case;
+        # the add-field case may corrupt slightly when its serialized
+        # markdown changed lengths, but that's the lesser evil.
+        if focus is None or sip.isdeleted(focus):
+            if (fallback_line_edit is not None
+                    and not sip.isdeleted(fallback_line_edit)):
+                focus = fallback_line_edit
+            else:
+                return
+
+        # Empty URL → strip any link off the selection, keep the text.
+        if not url:
+            self._unlink_selection(focus)
+            return
+
+        if isinstance(focus, _NoteTextEdit):
+            self._apply_link_to_text_edit(
+                focus, url, selected, sel_start, sel_end)
+        elif isinstance(focus, QTextEdit):
+            self._apply_link_to_popup(
+                focus, url, selected, sel_start, sel_end)
+        elif isinstance(focus, QLineEdit):
+            self._apply_link_to_line_edit(
+                focus, url, selected, sel_start, sel_end)
+
+        if self._commit_add_field_link_if_needed(focus):
+            return
+        if focus and not sip.isdeleted(focus):
+            focus.setFocus()
+
+    # ── _insert_link helpers ────────────────────────────────────────
+
+    def _can_insert_link_at(self, focus: Optional[QWidget]) -> bool:
+        """Validate whether a link can be inserted at the focused widget.
+
+        Refuses non-editor widgets (sidebar search, find input), and
+        refuses if the cursor/selection is on or contains an image
+        fragment — that would corrupt the link's anchor span.
+        """
+        if not isinstance(focus, (_NoteTextEdit, QTextEdit, QLineEdit)):
+            return False
         if (focus is getattr(self, '_search', None)
                 or focus is getattr(self, '_find_input', None)):
-            return
-        # Block if cursor/selection is on an image
+            return False
         if isinstance(focus, _NoteTextEdit):
             cursor = focus.textCursor()
             if cursor.charFormat().isImageFormat():
-                return
+                return False
             if cursor.hasSelection():
-                # Walk the selection for image fragments
                 start, end = cursor.selectionStart(), cursor.selectionEnd()
                 check = QTextCursor(focus.document())
                 check.setPosition(start)
                 while check.position() < end:
                     if check.charFormat().isImageFormat():
-                        return
+                        return False
                     if not check.movePosition(QTextCursor.NextCharacter):
                         break
-        # Remember selected text + its position before the dialog.
-        # Checklist expand popups dismiss on focus loss when the URL
-        # dialog opens, destroying the live selection — so we snapshot
-        # enough state to replay the edit against the fallback line edit.
+        return True
+
+    @staticmethod
+    def _snapshot_selection(focus: QWidget) -> tuple[str, int, int]:
+        """Capture the current selection's text and bounds.
+
+        Returns ``(selected, sel_start, sel_end)``; an empty selection
+        yields ``('', -1, -1)``.  The captured coordinates outlive any
+        popup dismiss-on-focus-loss the URL modal might trigger, which
+        is why we snapshot before opening the dialog rather than
+        reading the live cursor afterwards.
+        """
         selected = ''
         sel_start = -1
         sel_end = -1
@@ -2054,59 +2115,71 @@ class NotesDialog(_NotesFindBarMixin, QDialog):
                 selected = focus.selectedText()
                 sel_start = focus.selectionStart()
                 sel_end = sel_start + len(selected)
+        return selected, sel_start, sel_end
 
-        # If focus is a checklist popup, remember the underlying line
-        # edit as a fallback — the popup will dismiss when the URL
-        # dialog steals focus.  Covers BOTH item popups and the
-        # "Add item" field popup at the bottom of the checklist.
-        fallback_line_edit: Optional[QLineEdit] = None
+    def _fallback_line_edit_for(
+        self, focus: QWidget,
+    ) -> Optional[QLineEdit]:
+        """Identify the line edit to fall back to if a checklist popup dies.
+
+        When the URL dialog opens, a checklist expand-popup may dismiss
+        on focus-out and destroy the live editor.  Routing the link
+        into the underlying line edit (item or add-field) avoids
+        losing the edit entirely.  Returns ``None`` for non-popup
+        focus targets.
+        """
         if (isinstance(focus, QTextEdit)
                 and not isinstance(focus, _NoteTextEdit)):
             parent_item = focus.parent()
             if (isinstance(parent_item, _ChecklistItemWidget)
                     and parent_item._popup is focus):
-                fallback_line_edit = parent_item._edit
-            elif (hasattr(self, '_checklist')
+                return parent_item._edit
+            if (hasattr(self, '_checklist')
                     and self._checklist._add_popup is focus):
-                fallback_line_edit = self._checklist._add_field
+                return self._checklist._add_field
+        return None
 
-        # Pre-fill with clipboard text if it looks like a URL
+    def _prompt_for_url(self, focus: QWidget) -> Optional[str]:
+        """Show the URL input dialog and return the validated URL.
+
+        * Returns the URL string (possibly empty for "unlink") on OK.
+        * Returns ``None`` if the user cancelled.
+        * Re-prompts on a non-empty, non-URL-looking value.
+        * Pre-fills with the clipboard text when it parses as a URL.
+        * Suppresses checklist-popup focus-out dismissal while the
+          modal is up so saved selection coordinates stay valid —
+          otherwise the popup serializes to markdown and updates
+          ``_raw_text``, after which the captured display-coordinate
+          ``sel_start``/``sel_end`` no longer point at the intended
+          raw range (e.g. linking ``b`` in ``[a](u1) b`` would slice
+          inside the existing link's brackets).
+        """
         clipboard = QApplication.clipboard()
         clip = clipboard.text().strip() if clipboard else ''
         prefill = clip if _ANY_URL_RE.fullmatch(clip) else ''
 
-        # Suppress the checklist popup's focus-out dismissal while the
-        # URL dialog is open.  Otherwise the popup serializes to
-        # markdown and updates ``_raw_text``, and the captured
-        # ``sel_start/sel_end`` (in popup plain-text coordinates) no
-        # longer match the raw text's positions — slicing raw markdown
-        # with those positions corrupts content (e.g. ``[a](u1) b``
-        # becomes ``[a]b`` after trying to link ``b``).
         popup_had_suppression = False
         if (isinstance(focus, QTextEdit)
                 and not isinstance(focus, _NoteTextEdit)):
             popup_had_suppression = True
             focus._suppress_dismiss = True
-
         try:
             while True:
                 url, ok = QInputDialog.getText(
                     self, 'Insert Link', 'URL:', QLineEdit.Normal, prefill)
                 if not ok:
-                    return
+                    return None
                 url = url.strip()
-                # Empty URL is allowed — it means "unset any link on the
-                # selection".  Any other non-matching string is still an
-                # error and re-prompts.
                 if not url or _ANY_URL_RE.fullmatch(url):
-                    break
+                    return url
                 prefill = url
-                QMessageBox.warning(self, 'Invalid URL',
-                                    'Please enter a valid URL (e.g. https://…)')
+                QMessageBox.warning(
+                    self, 'Invalid URL',
+                    'Please enter a valid URL (e.g. https://…)')
         finally:
             # Clear the flag so the popup dismisses normally on its
-            # next focus loss (the one that was suppressed has
-            # already been consumed by the modal).
+            # next focus loss (the one suppressed here was consumed
+            # by the modal).
             if (popup_had_suppression
                     and focus is not None
                     and not sip.isdeleted(focus)):
@@ -2114,134 +2187,122 @@ class NotesDialog(_NotesFindBarMixin, QDialog):
                 # Restore focus so typing after Cmd+K stays in the popup.
                 focus.setFocus()
 
-        # The dialog may have caused the popup to dismiss.  If so, route
-        # the link into its parent's line edit rather than falling back
-        # to whatever Qt decided to focus next (which may be the sidebar
-        # search — that is how URLs used to leak into the search box).
-        if focus is None or sip.isdeleted(focus):
-            if (fallback_line_edit is not None
-                    and not sip.isdeleted(fallback_line_edit)):
-                # Safety net for the case where something destroyed the
-                # popup while the modal was up despite ``_suppress_dismiss``.
-                # For item line edits the ``_raw_text``/``_display_to_raw_pos``
-                # path below handles the markdown-vs-display offset.  For
-                # the add field the dismissed popup serializes markdown
-                # into the line edit, so display-coordinate
-                # ``sel_start``/``sel_end`` may no longer point at the
-                # intended range — we accept a potentially corrupted edit
-                # here as the lesser evil to losing the link entirely.
-                focus = fallback_line_edit
-            else:
-                return
+    @staticmethod
+    def _apply_link_to_text_edit(
+        focus: '_NoteTextEdit', url: str,
+        selected: str, sel_start: int, sel_end: int,
+    ) -> None:
+        """Apply the link to a ``_NoteTextEdit`` using saved bounds.
 
-        # Empty URL → strip any link off the selection, keep the text.
-        if not url:
-            self._unlink_selection(focus)
-            return
-
-        # Insert into whichever editor widget had focus.
-        # Use the captured ``sel_start`` / ``sel_end`` / ``selected``
-        # rather than the live cursor — the modal dialog can clear the
-        # visual selection on some platforms (macOS focus quirks).
+        ``mergeCharFormat`` preserves existing attributes (e.g. bold)
+        so a bold word becomes a bold *link* instead of a plain link.
+        The selection is collapsed before clearing the insertion
+        format — ``setCharFormat`` on a live selection would replace
+        the format we just merged.
+        """
         fmt = _link_char_format(url)
-        if isinstance(focus, _NoteTextEdit):
-            cursor = focus.textCursor()
-            if selected and sel_start >= 0:
-                # Re-anchor to the saved range and merge the link
-                # format — ``mergeCharFormat`` preserves existing
-                # attributes (e.g. bold) while adding anchor + colour
-                # + underline on top.  This is what lets a bold word
-                # become a bold *link* instead of a plain link.
-                cursor.setPosition(sel_start)
-                cursor.setPosition(sel_end, QTextCursor.KeepAnchor)
-                cursor.mergeCharFormat(fmt)
-                # Collapse the selection BEFORE clearing the
-                # insertion format — ``setCharFormat`` on a selection
-                # replaces the selection's format (which would undo
-                # the merge we just did).
-                cursor.setPosition(sel_end)
-            else:
-                cursor.insertText(url, fmt)
-            # Reset format so text typed after the link is normal
-            cursor.setCharFormat(QTextCharFormat())
-            focus.setTextCursor(cursor)
-        elif isinstance(focus, QTextEdit):
-            # Checklist expand popup (still alive).  Merge the link
-            # format onto the selection so existing bold/other char
-            # attributes survive.  If there's no saved selection, we
-            # insert fresh link text with just the link format.
-            cursor = focus.textCursor()
-            link_fmt = _link_char_format(url)
-            if selected and sel_start >= 0:
-                cursor.setPosition(sel_start)
-                cursor.setPosition(sel_end, QTextCursor.KeepAnchor)
-                cursor.mergeCharFormat(link_fmt)
-                # Collapse selection before setCharFormat (see
-                # _NoteTextEdit branch above for rationale).
-                cursor.setPosition(sel_end)
-            elif selected:
-                cursor.insertText(selected, link_fmt)
-            else:
-                cursor.insertText(url, link_fmt)
-            # Clear anchor format so subsequent typing isn't part of the
-            # link; Qt otherwise extends the anchor into neighbouring
-            # characters (same symptom as the text-note link bleed).
-            cursor.setCharFormat(QTextCharFormat())
-            focus.setTextCursor(cursor)
-            # insertText bypasses the popup's on_key wiring that normally
-            # fires text_edited — do it manually so the items list is
-            # updated before the popup dismisses (otherwise a quick
-            # navigate-away could save stale text).
-            parent_item = focus.parent()
-            if isinstance(parent_item, _ChecklistItemWidget):
-                parent_item.text_edited.emit(
-                    parent_item._index,
-                    _ChecklistItemWidget._serialize_popup_markdown(focus))
-        elif isinstance(focus, QLineEdit):
-            # Line edit (direct focus, or fallback after a popup dismissed).
-            # For checklist items the line edit shows STRIPPED display
-            # (markdown link syntax + STX/ETX bold markers hidden),
-            # so the saved ``sel_start/sel_end`` are in display
-            # coordinates.  Map them to raw-text positions before
-            # slicing — otherwise a raw like ``[a](u) asdas`` with a
-            # display-position of 2 would slice at raw position 2
-            # (inside the link brackets), corrupting the markdown.
-            replacement = f'[{selected}]({url})' if selected else url
-            parent_item = focus.parent()
-            if isinstance(parent_item, _ChecklistItemWidget):
-                source = parent_item._raw_text
-                if selected and sel_start >= 0:
-                    raw_start = _display_to_raw_pos(source, sel_start)
-                    raw_end = _display_to_raw_pos(source, sel_end)
-                    new_raw = source[:raw_start] + replacement + source[raw_end:]
-                else:
-                    new_raw = source + replacement
-                parent_item.set_raw_text(new_raw)
-            else:
-                # Plain line edit (add-field / else) — plain text path.
-                if selected and sel_start >= 0 and sel_end <= len(focus.text()):
-                    text = focus.text()
-                    focus.setText(text[:sel_start] + replacement + text[sel_end:])
-                    focus.setCursorPosition(sel_start + len(replacement))
-                elif focus.hasSelectedText():
-                    focus.del_()
-                    focus.insert(replacement)
-                else:
-                    focus.insert(replacement)
-        # If the link was inserted into the checklist's "Add item" field
-        # (or its expand popup), commit it as a new item immediately so
-        # the user never sees raw ``[text](url)`` syntax lingering in
-        # the add-field awaiting Enter.
-        checklist = getattr(self, '_checklist', None)
-        if checklist is not None:
-            add_field = getattr(checklist, '_add_field', None)
-            add_popup = getattr(checklist, '_add_popup', None)
-            if focus is add_field or (add_popup is not None and focus is add_popup):
-                checklist._on_add_item()
-                return
+        cursor = focus.textCursor()
+        if selected and sel_start >= 0:
+            cursor.setPosition(sel_start)
+            cursor.setPosition(sel_end, QTextCursor.KeepAnchor)
+            cursor.mergeCharFormat(fmt)
+            cursor.setPosition(sel_end)
+        else:
+            cursor.insertText(url, fmt)
+        # Reset format so text typed after the link is normal.
+        cursor.setCharFormat(QTextCharFormat())
+        focus.setTextCursor(cursor)
 
-        if focus and not sip.isdeleted(focus):
-            focus.setFocus()
+    @staticmethod
+    def _apply_link_to_popup(
+        focus: QTextEdit, url: str,
+        selected: str, sel_start: int, sel_end: int,
+    ) -> None:
+        """Apply the link to a still-alive checklist expand popup.
+
+        Mirrors ``_apply_link_to_text_edit`` but also emits
+        ``text_edited`` on the parent ``_ChecklistItemWidget`` —
+        ``insertText`` bypasses the popup's ``on_key`` wiring that
+        normally fires the signal, so without this a fast
+        navigate-away could save stale item text.
+        """
+        link_fmt = _link_char_format(url)
+        cursor = focus.textCursor()
+        if selected and sel_start >= 0:
+            cursor.setPosition(sel_start)
+            cursor.setPosition(sel_end, QTextCursor.KeepAnchor)
+            cursor.mergeCharFormat(link_fmt)
+            cursor.setPosition(sel_end)
+        elif selected:
+            cursor.insertText(selected, link_fmt)
+        else:
+            cursor.insertText(url, link_fmt)
+        # Clear anchor format so subsequent typing isn't part of the
+        # link; Qt otherwise extends the anchor into neighbouring
+        # characters (same symptom as the text-note link bleed).
+        cursor.setCharFormat(QTextCharFormat())
+        focus.setTextCursor(cursor)
+        parent_item = focus.parent()
+        if isinstance(parent_item, _ChecklistItemWidget):
+            parent_item.text_edited.emit(
+                parent_item._index,
+                _ChecklistItemWidget._serialize_popup_markdown(focus))
+
+    @staticmethod
+    def _apply_link_to_line_edit(
+        focus: QLineEdit, url: str,
+        selected: str, sel_start: int, sel_end: int,
+    ) -> None:
+        """Apply the link to a ``QLineEdit``, mapping display→raw for items.
+
+        For checklist items the line edit shows STRIPPED display
+        (markdown link syntax and STX/ETX bold markers hidden), so
+        the saved ``sel_start``/``sel_end`` are in display
+        coordinates.  Map them to raw-text positions before slicing —
+        otherwise a raw like ``[a](u) asdas`` with display-position 2
+        would slice at raw position 2 (inside the existing link's
+        brackets), corrupting the markdown.
+        """
+        replacement = f'[{selected}]({url})' if selected else url
+        parent_item = focus.parent()
+        if isinstance(parent_item, _ChecklistItemWidget):
+            source = parent_item._raw_text
+            if selected and sel_start >= 0:
+                raw_start = _display_to_raw_pos(source, sel_start)
+                raw_end = _display_to_raw_pos(source, sel_end)
+                new_raw = source[:raw_start] + replacement + source[raw_end:]
+            else:
+                new_raw = source + replacement
+            parent_item.set_raw_text(new_raw)
+            return
+        # Plain line edit (add-field or anything else) — plain text path.
+        if selected and sel_start >= 0 and sel_end <= len(focus.text()):
+            text = focus.text()
+            focus.setText(text[:sel_start] + replacement + text[sel_end:])
+            focus.setCursorPosition(sel_start + len(replacement))
+        elif focus.hasSelectedText():
+            focus.del_()
+            focus.insert(replacement)
+        else:
+            focus.insert(replacement)
+
+    def _commit_add_field_link_if_needed(self, focus: QWidget) -> bool:
+        """Commit the add-field as a new item when the link landed in it.
+
+        Returns True iff the add-field was committed; the caller
+        should not re-focus afterwards.  Avoids leaving raw
+        ``[text](url)`` syntax lingering in the add-field awaiting
+        Enter — the user should never see it.
+        """
+        checklist = getattr(self, '_checklist', None)
+        if checklist is None:
+            return False
+        add_field = getattr(checklist, '_add_field', None)
+        add_popup = getattr(checklist, '_add_popup', None)
+        if focus is add_field or (add_popup is not None and focus is add_popup):
+            checklist._on_add_item()
+            return True
+        return False
 
     def keyPressEvent(self, event: 'QKeyEvent') -> None:  # type: ignore[override]
         """Handle keyboard shortcuts."""
