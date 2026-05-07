@@ -179,6 +179,17 @@ class CodexProvider(CLIProvider):
         # Prepend these two tokens so they stay in front of any user flags.
         return ['resume', session_id]
 
+    # Note: ``relocate_session`` is intentionally NOT overridden —
+    # Codex stores sessions by date + UUID at
+    # ``~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl``,
+    # not cwd-derived path.  ``codex resume <uuid>`` already works
+    # in any cwd, so the base ``return None`` is the right answer:
+    # the leap-resume / monitor callers detect the ``None``, fall
+    # through to ``target_cwd = current_cwd``, and the resume runs
+    # successfully.  The recorded ``cwd`` field in
+    # ``cli_sessions/codex/<tag>.json`` self-heals on the next hook
+    # fire (SessionStart re-records with the new cwd).
+
     # -- Hook configuration ----------------------------------------------
 
     @property

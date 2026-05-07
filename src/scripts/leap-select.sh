@@ -25,6 +25,19 @@ if [ "$1" = "--resume" ]; then
     exec "$SCRIPT_DIR/leap-main.sh" "$@"
 fi
 
+# Honour LEAP_CLI env var: when set (e.g. from a GUI-spawned resume
+# terminal that prefixes ``LEAP_RESUME_SESSION_ID=… LEAP_CLI=… leap
+# <tag>``, or from one of the per-CLI wrappers like
+# ``codex-leap-main.sh``), skip the interactive CLI selector and let
+# leap-main.sh resolve the provider from the env var.  Without this,
+# the selector pops up, the user's pick gets passed as ``--cli`` —
+# which leap-main.sh then treats as overriding LEAP_CLI — and the
+# resume hand-off in leap-server.py silently drops the recorded
+# session because its ``cli_name == resume_cli`` gate fails.
+if [ -n "$LEAP_CLI" ]; then
+    exec "$SCRIPT_DIR/leap-main.sh" "$@"
+fi
+
 # Find Python (same logic as leap-main.sh)
 if [ -f "$VENV_PATH_FILE" ]; then
     PYTHON_CMD="$(cat "$VENV_PATH_FILE")/bin/python3"

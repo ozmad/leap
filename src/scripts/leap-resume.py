@@ -16,10 +16,17 @@ selection hand-off is CLI-agnostic:
      the right argv — ``--resume=<uuid>`` for Claude, ``resume <uuid>``
      for Codex, whatever a custom CLI implements.
 
+Pre-pick mode (``--cli=<X> --tag=<Y> --session=<Z>``): the GUI calls
+this to hand off a session it already picked.  The interactive picker
+is skipped; everything after the pick (cwd choice, tag-busy check,
+server hand-off) still runs in the terminal where the user can
+interact with prompts.
+
 Runs from any directory — the storage location is resolved from the
 Leap project root recorded at install time, not from `cwd`.
 """
 
+import argparse
 import json
 import os
 import re
@@ -315,21 +322,54 @@ def _viewport(idx: int, total: int, term_rows: int) -> tuple[int, int]:
     return start, start + visible
 
 
+def _row_freshness(r) -> float:
+    """Sort key: most-recent session's ``last_seen`` (0 for empty rows)."""
+    return r.sessions[0].last_seen if r.sessions else 0.0
+
+
 def _filter_rows(rows: list, query: str) -> list:
+    """Tag/CLI matches first, cwd-only matches after; each bucket
+    sorted newest-first.
+
+    A row that matches the query in *any* of (tag, cli) outranks a
+    row that matches only in cwd, so the user can type a tag
+    fragment without having a working-directory hit drown out the
+    obvious answer.  Inside each bucket we sort explicitly by the
+    tag's freshest session's ``last_seen`` so the "newest first"
+    contract holds regardless of the caller's input order.
+    """
     if not query:
-        return rows
+        return sorted(rows, key=_row_freshness, reverse=True)
     q = query.lower()
-    return [r for r in rows if q in r.tag.lower()
-            or q in r.cli.lower()
-            or q in _shorten_cwd(r.sessions[0].cwd).lower()]
+    tag_hits: list = []
+    cwd_hits: list = []
+    for r in rows:
+        if q in r.tag.lower() or q in r.cli.lower():
+            tag_hits.append(r)
+        elif q in _shorten_cwd(r.sessions[0].cwd).lower():
+            cwd_hits.append(r)
+    tag_hits.sort(key=_row_freshness, reverse=True)
+    cwd_hits.sort(key=_row_freshness, reverse=True)
+    return tag_hits + cwd_hits
 
 
 def _filter_sessions(sessions: list, query: str) -> list:
+    """Session-id (short) matches first, cwd-only matches after; each
+    bucket sorted newest-first by ``last_seen``."""
+    key = lambda s: s.last_seen
     if not query:
-        return sessions
+        return sorted(sessions, key=key, reverse=True)
     q = query.lower()
-    return [s for s in sessions if q in s.session_id[:8].lower()
-            or q in _shorten_cwd(s.cwd).lower()]
+    id_hits: list = []
+    cwd_hits: list = []
+    for s in sessions:
+        if q in s.session_id[:8].lower():
+            id_hits.append(s)
+        elif q in _shorten_cwd(s.cwd).lower():
+            cwd_hits.append(s)
+    id_hits.sort(key=key, reverse=True)
+    cwd_hits.sort(key=key, reverse=True)
+    return id_hits + cwd_hits
 
 
 def _write_row(plain: str, is_selected: bool, split_at: int) -> None:
@@ -688,7 +728,54 @@ def _try_relocate(
     return new_path is not None
 
 
+def _parse_args() -> argparse.Namespace:
+    """Parse pre-pick args (used by the GUI) or fall through to interactive.
+
+    All three of ``--cli``/``--tag``/``--session`` must be supplied
+    together; passing only some is rejected so a typo can't accidentally
+    fall through to the picker (where the user might re-pick something
+    different and be confused).
+    """
+    p = argparse.ArgumentParser(
+        prog='leap --resume',
+        description='Pick a recorded CLI session and resume it.',
+    )
+    p.add_argument('--cli', dest='cli', default='',
+                   help="Pre-picked CLI provider name (skip the picker).")
+    p.add_argument('--tag', dest='tag', default='',
+                   help="Pre-picked Leap tag (skip the picker).")
+    p.add_argument('--session', dest='session', default='',
+                   help="Pre-picked CLI session id (skip the picker).")
+    args = p.parse_args()
+    if any((args.cli, args.tag, args.session)):
+        if not all((args.cli, args.tag, args.session)):
+            p.error("--cli, --tag and --session must be provided together")
+    return args
+
+
+def _lookup_pre_picked(
+    rows: list, cli: str, tag: str, session_id: str,
+) -> Optional[tuple]:
+    """Find ``(TagRow, SessionRecord)`` for an already-picked session.
+
+    Returns ``None`` when the records have moved on since the GUI
+    showed them — e.g. the user picked a session that was relocated
+    or pruned between dialog open and terminal launch.  The caller
+    surfaces a clear error rather than bouncing them into the
+    interactive picker (which would surprise the user with a fresh
+    selection step they didn't ask for).
+    """
+    for r in rows:
+        if r.cli != cli or r.tag != tag:
+            continue
+        for s in r.sessions:
+            if s.session_id == session_id:
+                return r, s
+    return None
+
+
 def main() -> int:
+    args = _parse_args()
     rows = _load_tag_entries()
     if not rows:
         sys.stderr.write(
@@ -703,33 +790,49 @@ def main() -> int:
         sys.stderr.write(f"  {RED}leap --resume requires an interactive terminal.{RESET}\n")
         return 1
 
-    # Outer loop so Esc from the session sub-picker can bounce back to
-    # the tag picker without restarting `main`.
     chosen_tag = None
     chosen_session = None
-    try:
-        while True:
-            tag_row, n_tags = _pick_tag(rows)
-            sys.stderr.write(f"\033[{n_tags + 2}A\033[J")
-            if tag_row is None:
-                sys.stderr.write(f"  {DIM}Cancelled.{RESET}\n")
-                return 130
-            sessions = tag_row.sessions
-            if len(sessions) == 1:
-                chosen_tag, chosen_session = tag_row, sessions[0]
+
+    if args.cli and args.tag and args.session:
+        # Pre-pick mode (GUI hand-off).  Skip the picker entirely; the
+        # GUI already did the selection step.  Surface a clear error
+        # if the records moved on since then so we never fall back to
+        # interactive picking against the user's expectations.
+        found = _lookup_pre_picked(rows, args.cli, args.tag, args.session)
+        if found is None:
+            sys.stderr.write(
+                f"  {RED}The picked session is no longer recorded — it may "
+                f"have been pruned, relocated, or its transcript deleted.{RESET}\n"
+                f"  {DIM}cli={args.cli} tag={args.tag} session={args.session[:8]}…{RESET}\n"
+            )
+            return 1
+        chosen_tag, chosen_session = found
+    else:
+        # Interactive picker.  Outer loop so Esc from the session
+        # sub-picker bounces back to the tag picker without restarting.
+        try:
+            while True:
+                tag_row, n_tags = _pick_tag(rows)
+                sys.stderr.write(f"\033[{n_tags + 2}A\033[J")
+                if tag_row is None:
+                    sys.stderr.write(f"  {DIM}Cancelled.{RESET}\n")
+                    return 130
+                sessions = tag_row.sessions
+                if len(sessions) == 1:
+                    chosen_tag, chosen_session = tag_row, sessions[0]
+                    break
+                result, n_sessions = _pick_session(tag_row.tag, tag_row.cli, sessions)
+                sys.stderr.write(f"\033[{n_sessions + 2}A\033[J")
+                if result is _ABORT:
+                    sys.stderr.write(f"  {DIM}Cancelled.{RESET}\n")
+                    return 130
+                if result is None:
+                    continue  # Esc in sub-picker → back to tag picker
+                chosen_tag, chosen_session = tag_row, result
                 break
-            result, n_sessions = _pick_session(tag_row.tag, tag_row.cli, sessions)
-            sys.stderr.write(f"\033[{n_sessions + 2}A\033[J")
-            if result is _ABORT:
-                sys.stderr.write(f"  {DIM}Cancelled.{RESET}\n")
-                return 130
-            if result is None:
-                continue  # Esc in sub-picker → back to tag picker
-            chosen_tag, chosen_session = tag_row, result
-            break
-    except KeyboardInterrupt:
-        sys.stderr.write("\n")
-        return 130
+        except KeyboardInterrupt:
+            sys.stderr.write("\n")
+            return 130
 
     tag = chosen_tag.tag
     cli = chosen_tag.cli
@@ -770,12 +873,23 @@ def main() -> int:
             return 130
         tag = new_tag
 
-    # Cross-cwd resume: when the recorded cwd differs from the user's
-    # current shell cwd, prompt for which one to use.  Skipped when
-    # they're the same (nothing to choose).  Picking "current" triggers
-    # ``_try_relocate`` (Claude) so the resume still finds the session.
+    # Cross-cwd resume: only providers with cwd-bound resume need the
+    # picker (Claude, Gemini).  CLIs that key sessions by UUID alone
+    # (Codex) or handle cross-cwd resume in their own UI (Cursor's
+    # built-in prompt) keep working from the current cwd unmodified —
+    # asking would just be a redundant prompt before their own.
     current_cwd = os.getcwd()
-    if target_cwd and target_cwd != current_cwd:
+    needs_cwd_pick = False
+    if get_provider is not None:
+        try:
+            needs_cwd_pick = get_provider(cli).requires_cwd_bound_resume
+        except ValueError:
+            needs_cwd_pick = False
+    if not needs_cwd_pick:
+        # Hand off from wherever the user currently is; the CLI will
+        # locate the session by id (or prompt the user itself).
+        target_cwd = current_cwd
+    elif target_cwd and target_cwd != current_cwd:
         choice = _ask_cwd_choice(target_cwd, current_cwd)
         if choice is None:
             sys.stderr.write(f"  {DIM}Cancelled.{RESET}\n")
@@ -791,10 +905,10 @@ def main() -> int:
             if relocated is None:
                 return 1
             # ``_try_relocate`` returns False when the provider doesn't
-            # support cross-cwd relocation (non-Claude today).  In that
-            # case the resume itself may not find the session, but the
-            # user explicitly opted into the current cwd — accept it
-            # and let the CLI start fresh if it has to.
+            # support cross-cwd relocation.  In that case the resume
+            # itself may not find the session, but the user explicitly
+            # opted into the current cwd — accept it and let the CLI
+            # start fresh if it has to.
             target_cwd = current_cwd
 
     # Verify the chosen cwd is usable.  When the user picked "current"

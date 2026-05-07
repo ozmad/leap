@@ -384,6 +384,11 @@ def load_raw_tag_rows(storage_dir: Path) -> list[TagRow]:
     legitimately-live second owner in the pathological (though
     physically rare) case where two Leap tags are resuming the same
     CLI session concurrently.
+
+    Provider-level staleness (``provider.session_exists``) is applied
+    here too, so CLIs whose records lack a ``transcript_path`` (e.g.
+    Cursor) can still self-filter when their on-disk chat dir was
+    deleted out-of-band.
     """
     root = _sessions_root(storage_dir)
     if not root.is_dir():
@@ -404,6 +409,7 @@ def load_raw_tag_rows(storage_dir: Path) -> list[TagRow]:
             if not _is_safe_id(tag):
                 continue
             sessions = _resumable_sessions(_load_raw_entries(path))
+            sessions = _filter_provider_stale(sessions, cli)
             if not sessions:
                 continue
             rows.append(TagRow(
@@ -414,6 +420,31 @@ def load_raw_tag_rows(storage_dir: Path) -> list[TagRow]:
             ))
     rows.sort(key=lambda r: r.last_seen, reverse=True)
     return rows
+
+
+def _filter_provider_stale(
+    sessions: list[SessionRecord], cli: str,
+) -> list[SessionRecord]:
+    """Drop sessions whose ``provider.session_exists`` returns ``False``.
+
+    Lazy-imports the registry so this leaf module doesn't gain a
+    hard dependency on ``leap.cli_providers`` (which would invert the
+    utils ↔ cli_providers layering and complicate test setups).
+    Returns the input unchanged if the provider can't be resolved
+    (unknown CLI / import error) — better to over-show than hide a
+    legitimately-resumable session.
+    """
+    if not sessions:
+        return sessions
+    try:
+        from leap.cli_providers.registry import get_provider
+    except ImportError:
+        return sessions
+    try:
+        provider = get_provider(cli)
+    except ValueError:
+        return sessions
+    return [s for s in sessions if provider.session_exists(s.session_id, s.cwd)]
 
 
 def load_tag_rows(storage_dir: Path) -> list[TagRow]:

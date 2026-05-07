@@ -54,8 +54,12 @@ fi
 # and LEAP_RESUME_CLI env vars set.  The picker script handles chdir'ing
 # into the session's original cwd and enforces liveness checks.
 if [ "$1" = "--resume" ]; then
+    shift
+    # Any remaining args (e.g. --cli=X --tag=Y --session=Z from a GUI
+    # pre-pick hand-off) are forwarded to leap-resume.py.  Bare
+    # ``leap --resume`` keeps its interactive picker.
     PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}" \
-        exec "$PYTHON_CMD" "$PROJECT_DIR/src/scripts/leap-resume.py"
+        exec "$PYTHON_CMD" "$PROJECT_DIR/src/scripts/leap-resume.py" "$@"
 fi
 
 # Run Slack bot if requested

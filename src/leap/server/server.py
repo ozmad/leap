@@ -3266,20 +3266,100 @@ def main() -> None:
     # provider for its resume-argv (prepended so positional subcommand
     # forms like Codex `resume <id>` stay in the front) and then strip
     # those env vars so they don't leak into the CLI process.
+    #
+    # If LEAP_RESUME_SESSION_ID is set we MUST honor it — silently
+    # falling through to a fresh session would look like a normal
+    # startup and the user would never realise their resume was lost.
+    # Every "can't honor" case below exits non-zero with a clear
+    # stderr message.
     resume_id = os.environ.pop('LEAP_RESUME_SESSION_ID', '')
     resume_cli = os.environ.pop('LEAP_RESUME_CLI', '')
-    if resume_id and resume_cli and (not cli_name or cli_name == resume_cli):
+    if resume_id:
+        _apply_resume_or_fail(resume_id, resume_cli, cli_name, tag)
+        # _apply_resume_or_fail either exits or returns the (flags, cli_name)
+        # that should be used.  We re-fetch via locals because Python doesn't
+        # have output params; re-implement inline for clarity:
         try:
             provider = get_provider(resume_cli)
         except ValueError:
-            provider = None
-        if provider is not None and provider.supports_resume:
-            flags = provider.resume_args(resume_id) + flags
-            if not cli_name:
-                cli_name = resume_cli
+            provider = None  # _apply_resume_or_fail already exited; defensive
+        # mypy: provider is non-None here because _apply_resume_or_fail
+        # exited if it was None.
+        assert provider is not None
+        flags = provider.resume_args(resume_id) + flags
+        if not cli_name:
+            cli_name = resume_cli
 
     server = LeapServer(tag, flags=flags, cli=cli_name)
     server.run()
+
+
+def _apply_resume_or_fail(
+    resume_id: str, resume_cli: str, cli_name: Optional[str], tag: str,
+) -> None:
+    """Validate that we can honor a ``LEAP_RESUME_*`` hand-off.
+
+    Exits with a clear stderr message and exit code 1 in any case
+    where the resume would be silently dropped — see Question 3 of
+    the resume bug-hunt: silent drops are confusing because the user
+    sees a normal-looking session whose history is gone.
+
+    Cases that exit:
+
+    * ``LEAP_RESUME_CLI`` is empty — the picker should always set
+      both, so an unset value is a misuse.
+    * Provider name is unknown to the registry.
+    * Provider exists but doesn't implement ``supports_resume``.
+    * ``--cli <X>`` and ``LEAP_RESUME_CLI <Y>`` disagree — we'd be
+      asked to apply CLI X's resume args against CLI Y's argv.
+    """
+    yellow = "\033[33m"
+    reset = "\033[0m"
+    short = resume_id[:8] + "…" if len(resume_id) > 8 else resume_id
+
+    if not resume_cli:
+        print(
+            f"\n  {yellow}✗ Refusing to start: LEAP_RESUME_SESSION_ID is set "
+            f"but LEAP_RESUME_CLI is empty.{reset}\n"
+            f"  Cannot apply resume {short} without a CLI provider name.\n"
+            f"  This usually means the resume hand-off was constructed "
+            f"manually — re-run `leap --resume` to pick a session.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if cli_name and cli_name != resume_cli:
+        print(
+            f"\n  {yellow}✗ Refusing to start: --cli='{cli_name}' "
+            f"conflicts with LEAP_RESUME_CLI='{resume_cli}'.{reset}\n"
+            f"  Resume session {short} was recorded for "
+            f"'{resume_cli}'; can't apply it to '{cli_name}'.\n"
+            f"  Either drop --cli or unset LEAP_RESUME_*.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        provider = get_provider(resume_cli)
+    except ValueError:
+        print(
+            f"\n  {yellow}✗ Refusing to start: unknown CLI provider "
+            f"'{resume_cli}' from LEAP_RESUME_CLI.{reset}\n"
+            f"  Cannot apply resume {short}.\n"
+            f"  This may mean the provider was removed or renamed in "
+            f"a recent Leap update.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not provider.supports_resume:
+        print(
+            f"\n  {yellow}✗ Refusing to start: provider '{resume_cli}' "
+            f"does not support resume.{reset}\n"
+            f"  Cannot apply resume {short} for tag '{tag}'.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

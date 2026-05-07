@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from leap.cli_providers.base import CLIProvider
 from leap.cli_providers.states import SIGNAL_STATES
+from leap.utils.cursor_session_move import find_chat_dir, relocate_cursor_session
 
 
 # Cursor hooks.json schema:
@@ -156,6 +157,23 @@ class CursorAgentProvider(CLIProvider):
     def supports_resume(self) -> bool:
         return True
 
+    @property
+    def requires_cwd_bound_resume(self) -> bool:
+        # Cursor stores chats under ~/.cursor/chats/<MD5(workspace)>/<chatId>/
+        # so `cursor-agent --resume <chatId>` only finds the session
+        # when run from a cwd whose MD5 matches the chat's project dir
+        # (or after relocate_session moves it).
+        return True
+
+    def session_exists(self, session_id: str, cwd: str) -> bool:
+        """Cursor records have ``transcript_path=""`` so the picker's
+        path-based stale filter never fires.  Verify here by scanning
+        for the chat dir under any project hash — same fallback the
+        relocator uses, so a chat that cursor's workspace-root walk
+        landed under a parent's hash is still reachable.
+        """
+        return find_chat_dir(session_id, prefer_cwd=cwd) is not None
+
     def extract_session_id(self, hook_data: dict) -> Optional[str]:
         """Cursor Agent stores chats under
         ``~/.cursor/chats/<project-hash>/<chat-uuid>/`` and accepts the
@@ -189,6 +207,25 @@ class CursorAgentProvider(CLIProvider):
         # The flag/value pair flows through the server since the new
         # argv forwarder no longer drops non-`--` tokens.
         return ['--resume', session_id]
+
+    def relocate_session(
+        self,
+        session_id: str,
+        src_cwd: str,
+        dst_cwd: str,
+        *,
+        on_committed: Optional[Any] = None,
+    ) -> Optional[str]:
+        """Move ``~/.cursor/chats/<MD5(src)>/<chatId>/`` to the dst hash.
+
+        Delegates to :mod:`leap.utils.cursor_session_move` for the
+        atomic copy-verify-rename dance.  Returns the new chat-dir
+        path on success or ``None`` when the chat couldn't be located
+        (caller falls back to ``chdir`` into the recorded cwd).
+        """
+        return relocate_cursor_session(
+            session_id, src_cwd, dst_cwd, on_committed=on_committed,
+        )
 
     # -- Hook configuration ----------------------------------------------
 

@@ -128,6 +128,13 @@ class ClaudeProvider(CLIProvider):
     def supports_resume(self) -> bool:
         return True
 
+    @property
+    def requires_cwd_bound_resume(self) -> bool:
+        # Claude stores transcripts under ~/.claude/projects/<cwd-slug>/<uuid>.jsonl;
+        # `claude --resume=<uuid>` only finds the session when run from
+        # the matching cwd, so leap must offer the cwd-choice picker.
+        return True
+
     def extract_session_id(self, hook_data: dict) -> Optional[str]:
         """Claude Code's session id is the basename of ``transcript_path``
         (``~/.claude/projects/<slug>/<uuid>.jsonl``).  The ``.claude/projects/``

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from leap.cli_providers.base import CLIProvider
+from leap.utils.gemini_session_move import relocate_gemini_session
 
 
 GEMINI_CONFIG_DIR: Path = Path.home() / ".gemini"
@@ -123,6 +124,14 @@ class GeminiProvider(CLIProvider):
     def supports_resume(self) -> bool:
         return True
 
+    @property
+    def requires_cwd_bound_resume(self) -> bool:
+        # Gemini stores sessions under ~/.gemini/tmp/<slug>/chats/...
+        # where <slug> derives from cwd via projects.json registry;
+        # resume only locates the session when run from the matching
+        # cwd (or after relocate_session moves it).
+        return True
+
     def extract_session_id(self, hook_data: dict) -> Optional[str]:
         """Read Gemini's session UUID from the hook payload.
 
@@ -157,6 +166,30 @@ class GeminiProvider(CLIProvider):
         # Gemini's flag takes a value as a second token; Leap's server
         # argv forwarder keeps that value (no ``--``-only filter).
         return ['--resume', session_id]
+
+    def relocate_session(
+        self,
+        session_id: str,
+        src_cwd: str,
+        dst_cwd: str,
+        *,
+        on_committed: Optional[Any] = None,
+    ) -> Optional[str]:
+        """Move a Gemini session JSONL from src_cwd's slug to dst_cwd's.
+
+        Gemini stores sessions under
+        ``~/.gemini/tmp/<slug>/chats/session-<ts>-<short>.jsonl`` with
+        ``~/.gemini/projects.json`` mapping ``cwd → slug``.  Resume
+        running in a different cwd doesn't transparently work because
+        Gemini only looks under the slug for *its* cwd — so we
+        physically move the single session file into ``dst_cwd``'s
+        slug dir and update the registry.  See
+        :mod:`leap.utils.gemini_session_move` for the safety
+        properties (signal-blocked, atomic, verified).
+        """
+        return relocate_gemini_session(
+            session_id, src_cwd, dst_cwd, on_committed=on_committed,
+        )
 
     # -- Hook configuration ----------------------------------------------
 

@@ -429,6 +429,40 @@ class CLIProvider(ABC):
         """
         return []
 
+    def session_exists(self, session_id: str, cwd: str) -> bool:
+        """Whether this CLI's session is still resumable on disk.
+
+        Called by the picker to filter out records pointing at sessions
+        that have been deleted out-of-band (e.g. user ran ``rm -rf``
+        on the CLI's storage dir).  Default returns ``True`` — used by
+        CLIs that key sessions by id alone (Codex) where we can't
+        cheaply verify without invoking the CLI itself.
+
+        Override in providers whose storage layout lets us cheaply
+        stat the session's home dir (Cursor's ``~/.cursor/chats/<hash>/<id>/``,
+        Claude / Gemini already self-filter via the picker's
+        ``transcript_path`` existence check).
+        """
+        return True
+
+    @property
+    def requires_cwd_bound_resume(self) -> bool:
+        """Whether the recorded cwd matters when resuming this CLI's session.
+
+        Set ``True`` when the CLI stores transcripts in a cwd-derived
+        location (Claude's slug, Gemini's slug-registry) and
+        ``<cli> resume <id>`` only finds the session when run from that
+        cwd — leap then needs to either ``chdir`` into the recorded cwd
+        or relocate the transcript via :meth:`relocate_session`.
+
+        Default ``False``: the CLI keys sessions by UUID alone (Codex)
+        or handles cross-cwd resume natively in its own UI (Cursor's
+        built-in prompt).  In that case ``leap --resume`` skips its
+        cwd-choice prompt and lets the CLI take over from the user's
+        current working directory.
+        """
+        return False
+
     def relocate_session(
         self,
         session_id: str,
@@ -454,6 +488,11 @@ class CLIProvider(ABC):
         destination is verified in-place but *before* the source is
         deleted, so caller-side bookkeeping happens inside the same
         signal-blocked critical section the file move uses.
+
+        Only called when :attr:`requires_cwd_bound_resume` is ``True``
+        and the user picks "current cwd" in the picker — overriding it
+        without also setting ``requires_cwd_bound_resume = True`` is a
+        no-op.
         """
         return None
 
