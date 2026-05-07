@@ -48,17 +48,22 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 try:
-    from leap.cli_providers.registry import get_display_name
+    from leap.cli_providers.registry import get_display_name, get_provider
+    from leap.utils.claude_session_move import RelocationError
     from leap.utils.resume_store import (
         TagRow, SessionRecord, load_tag_rows, load_raw_tag_rows,
+        relocate_records,
     )
 except ImportError:
     def get_display_name(name: str) -> str:  # type: ignore[no-redef]
         return name
+    get_provider = None  # type: ignore
+    RelocationError = Exception  # type: ignore
     TagRow = None  # type: ignore
     SessionRecord = None  # type: ignore
     load_tag_rows = None  # type: ignore
     load_raw_tag_rows = None  # type: ignore
+    relocate_records = None  # type: ignore
 
 DIM = "\033[2m"
 BOLD = "\033[1m"
@@ -540,6 +545,66 @@ def _pick_session(tag: str, cli: str, all_sessions: list) -> tuple:
             n = _render_sessions(tag, cli, filtered, idx, first=False, last_n=n, query=query)
 
 
+def _try_relocate(
+    *,
+    cli: str,
+    session_id: str,
+    old_transcript_path: str,
+    src_cwd: str,
+    dst_cwd: str,
+) -> Optional[bool]:
+    """Move the picked CLI session's on-disk state from ``src_cwd`` to ``dst_cwd``.
+
+    Returns ``True`` when the session was relocated (caller should skip
+    the legacy chdir-into-original-cwd step), ``False`` when the
+    provider doesn't support cross-cwd relocation (caller falls back
+    to chdir), or ``None`` on a hard error (caller exits non-zero).
+
+    The provider's ``relocate_session`` is responsible for blocking
+    SIGINT/SIGTERM/etc. while the move is in flight — the user
+    physically cannot Ctrl+C out of a half-committed state.  The
+    bookkeeping callback runs inside the same critical section so the
+    on-disk records stay consistent with the moved files.
+    """
+    if get_provider is None or relocate_records is None:
+        return False  # leap module wasn't importable; fall back to chdir
+    try:
+        provider = get_provider(cli)
+    except ValueError:
+        return False
+
+    def _on_committed(new_path: str) -> None:
+        # Inside the signal-blocked section: rewrite every
+        # cli_sessions/<cli>/*.json entry that points at the old
+        # transcript path so the picker (and any other consumer)
+        # finds the session at its new home next time.
+        relocate_records(
+            STORAGE_DIR,
+            cli,
+            old_path=old_transcript_path,
+            new_path=new_path,
+            new_cwd=dst_cwd,
+        )
+
+    try:
+        new_path = provider.relocate_session(
+            session_id, src_cwd, dst_cwd, on_committed=_on_committed,
+        )
+    except RelocationError as e:
+        sys.stderr.write(
+            f"  {RED}Could not relocate session to current directory:{RESET}\n"
+            f"  {RED}{e}{RESET}\n"
+        )
+        return None
+    except Exception as e:
+        sys.stderr.write(
+            f"  {RED}Unexpected error relocating session: {e}{RESET}\n"
+        )
+        return None
+
+    return new_path is not None
+
+
 def main() -> int:
     rows = _load_tag_entries()
     if not rows:
@@ -629,6 +694,25 @@ def main() -> int:
             f"cannot locate the session.{RESET}\n"
         )
         return 1
+
+    # Cross-cwd resume: if the picked session was recorded under a
+    # different cwd than the user's current one, try to relocate the
+    # CLI's on-disk state so the resume can run in the *current* cwd
+    # without a manual `cd`.  Provider must support it (today: Claude
+    # only) — otherwise we fall through to the legacy chdir.
+    current_cwd = os.getcwd()
+    if target_cwd and target_cwd != current_cwd:
+        relocated = _try_relocate(
+            cli=cli,
+            session_id=session_id,
+            old_transcript_path=chosen_session.transcript_path,
+            src_cwd=target_cwd,
+            dst_cwd=current_cwd,
+        )
+        if relocated is None:
+            return 1
+        if relocated:
+            target_cwd = current_cwd
 
     sys.stderr.write(
         f"  {GREEN}Resuming{RESET} {_cli_label(cli)} {BOLD}{tag}{RESET} "

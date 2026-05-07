@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from leap.cli_providers.base import CLIProvider
+from leap.utils.claude_session_move import relocate_claude_session
 from leap.utils.menu import MENU_OPTION_RE
 
 
@@ -147,6 +148,18 @@ class ClaudeProvider(CLIProvider):
         # space-separated form would lose the UUID and make claude open
         # its own picker instead of resuming directly.
         return [f'--resume={session_id}']
+
+    def relocate_session(
+        self,
+        session_id: str,
+        src_cwd: str,
+        dst_cwd: str,
+        *,
+        on_committed: Optional[Any] = None,
+    ) -> Optional[str]:
+        return relocate_claude_session(
+            session_id, src_cwd, dst_cwd, on_committed=on_committed,
+        )
 
     # -- Last assistant message (Slack) ----------------------------------
 

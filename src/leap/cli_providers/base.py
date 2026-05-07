@@ -429,6 +429,34 @@ class CLIProvider(ABC):
         """
         return []
 
+    def relocate_session(
+        self,
+        session_id: str,
+        src_cwd: str,
+        dst_cwd: str,
+        *,
+        on_committed: Optional[Any] = None,
+    ) -> Optional[str]:
+        """Move this CLI's on-disk session state from ``src_cwd`` to ``dst_cwd``.
+
+        Used by ``leap --resume`` when the user picks a session that was
+        recorded in directory A but is currently working in directory B
+        — instead of forcing a ``cd`` into A, the resume picker calls
+        this to relocate the session's transcript so the CLI can find
+        it under B's slug.
+
+        Returns the new transcript path on success, or ``None`` if this
+        CLI doesn't support cross-cwd relocation (the picker will fall
+        back to ``chdir`` into the original cwd).  Raise an exception
+        on real failure — callers exit non-zero.
+
+        ``on_committed`` is invoked with the new path *after* the
+        destination is verified in-place but *before* the source is
+        deleted, so caller-side bookkeeping happens inside the same
+        signal-blocked critical section the file move uses.
+        """
+        return None
+
     # -- Hook payload extraction -----------------------------------------
 
     def extract_last_assistant_message(self, hook_data: dict) -> str:

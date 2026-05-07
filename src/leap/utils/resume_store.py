@@ -141,6 +141,73 @@ def record_session(
         pass
 
 
+def relocate_records(
+    storage_dir: Path,
+    cli: str,
+    *,
+    old_path: str,
+    new_path: str,
+    new_cwd: str,
+) -> int:
+    """Rewrite every entry whose ``transcript_path == old_path`` to point
+    at ``new_path`` (with ``cwd = new_cwd``).
+
+    Walks every ``<storage>/cli_sessions/<cli>/*.json`` file because the
+    same CLI session UUID can be recorded under multiple Leap tags
+    (forked-resume scenario).  Without this, the un-picked tags would
+    keep entries pointing at a now-vanished transcript path — the
+    picker filters those at read time, but cleaning them up keeps the
+    on-disk state self-consistent and avoids surprises for any future
+    consumer that doesn't go through the stale filter.
+
+    ``last_seen`` is **not** updated — the SessionStart(resume) hook
+    will bump it naturally on the next resume.
+
+    Atomic per-file via tmp + ``os.replace``; silent on individual
+    file errors so a single broken file doesn't abort the whole sweep.
+    Returns the number of files that were actually rewritten.
+    """
+    if not (cli and old_path and new_path):
+        return 0
+    if not _is_safe_id(cli):
+        return 0
+    cli_dir = _sessions_root(storage_dir) / cli
+    if not cli_dir.is_dir():
+        return 0
+    rewritten = 0
+    try:
+        tag_files = list(cli_dir.glob("*.json"))
+    except OSError:
+        return 0
+    for tag_file in tag_files:
+        entries = _load_raw_entries(tag_file)
+        if not entries:
+            continue
+        changed = False
+        for entry in entries:
+            if entry.get("transcript_path") == old_path:
+                entry["transcript_path"] = new_path
+                entry["cwd"] = new_cwd
+                changed = True
+        if not changed:
+            continue
+        tmp = tag_file.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(entries, indent=2))
+            os.replace(tmp, tag_file)
+            rewritten += 1
+        except (OSError, ValueError):
+            # Best-effort: the picker's stale filter will hide any
+            # entry whose transcript path doesn't exist, so a failed
+            # rewrite degrades to silent invisibility rather than data
+            # loss.  Try to clean up the orphan tmp.
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return rewritten
+
+
 def _resumable_sessions(raw: list[dict]) -> list[SessionRecord]:
     """Project raw entries → newest-first SessionRecords, dropping stale ones.
 

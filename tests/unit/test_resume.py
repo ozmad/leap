@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +26,7 @@ from leap.utils.resume_store import (
     load_tag_rows,
     prune_stale,
     record_session,
+    relocate_records,
 )
 
 
@@ -911,3 +913,92 @@ class TestLastAssistantMessage:
     def test_claude_returns_empty_when_no_transcript(self):
         p = get_provider("claude")
         assert p.extract_last_assistant_message({}) == ""
+
+
+# --------------------------------------------------------------------------
+# relocate_records — cross-tag bookkeeping after a cwd-relocate
+# --------------------------------------------------------------------------
+
+class TestRelocateRecords:
+    def test_rewrites_matching_entries_across_tags(self, tmp_path):
+        # Two tags hold entries pointing at the same old transcript path
+        # (forked-resume scenario).  After relocate, both should point
+        # at the new path with the new cwd.
+        old_tp = str(tmp_path / "old/abc.jsonl")
+        new_tp = str(tmp_path / "new/abc.jsonl")
+        # Create the underlying transcripts so record_session doesn't
+        # silently drop them later when we read back.
+        Path(old_tp).parent.mkdir(parents=True, exist_ok=True)
+        Path(old_tp).touch()
+        record_session(tmp_path, "claude", "tag1",
+                       session_id="abc", transcript_path=old_tp, cwd="/old")
+        record_session(tmp_path, "claude", "tag2",
+                       session_id="abc", transcript_path=old_tp, cwd="/old")
+        # Unrelated entry that must NOT be rewritten.
+        other_tp = str(tmp_path / "other.jsonl")
+        Path(other_tp).touch()
+        record_session(tmp_path, "claude", "tag1",
+                       session_id="other-id", transcript_path=other_tp, cwd="/other")
+
+        n = relocate_records(tmp_path, "claude",
+                             old_path=old_tp, new_path=new_tp, new_cwd="/new")
+        assert n == 2  # both tag files rewritten
+
+        tag1 = json.loads((tmp_path / "cli_sessions/claude/tag1.json").read_text())
+        tag2 = json.loads((tmp_path / "cli_sessions/claude/tag2.json").read_text())
+        # tag1: abc updated, other-id unchanged.
+        abc1 = next(e for e in tag1 if e["session_id"] == "abc")
+        other = next(e for e in tag1 if e["session_id"] == "other-id")
+        assert abc1["transcript_path"] == new_tp
+        assert abc1["cwd"] == "/new"
+        assert other["transcript_path"] == other_tp
+        assert other["cwd"] == "/other"
+        # tag2: also updated.
+        abc2 = next(e for e in tag2 if e["session_id"] == "abc")
+        assert abc2["transcript_path"] == new_tp
+        assert abc2["cwd"] == "/new"
+
+    def test_does_not_bump_last_seen(self, tmp_path):
+        # The SessionStart(resume) hook bumps last_seen naturally on
+        # the next resume; relocate_records must not touch it (so the
+        # picker's age column stays honest).
+        old_tp = str(tmp_path / "old.jsonl")
+        Path(old_tp).touch()
+        record_session(tmp_path, "claude", "t",
+                       session_id="abc", transcript_path=old_tp, cwd="/old")
+        before = json.loads((tmp_path / "cli_sessions/claude/t.json").read_text())
+        last_seen_before = before[0]["last_seen"]
+
+        new_tp = str(tmp_path / "new.jsonl")
+        time.sleep(0.01)
+        relocate_records(tmp_path, "claude",
+                         old_path=old_tp, new_path=new_tp, new_cwd="/new")
+        after = json.loads((tmp_path / "cli_sessions/claude/t.json").read_text())
+        assert after[0]["last_seen"] == last_seen_before
+
+    def test_no_op_when_no_records_match(self, tmp_path):
+        Path(tmp_path / "cli_sessions/claude").mkdir(parents=True)
+        record_session(tmp_path, "claude", "t",
+                       session_id="x", transcript_path=str(tmp_path / "x.jsonl"),
+                       cwd="/somewhere")
+        assert relocate_records(
+            tmp_path, "claude",
+            old_path="/never/recorded.jsonl",
+            new_path="/wherever.jsonl",
+            new_cwd="/x",
+        ) == 0
+
+    def test_rejects_unsafe_cli_id(self, tmp_path):
+        # Defense-in-depth: relocate_records refuses to walk a cli dir
+        # whose name doesn't match the safe-id pattern, so a crafted
+        # cli value can't escape ``cli_sessions/``.
+        assert relocate_records(
+            tmp_path, "../escape",
+            old_path="a", new_path="b", new_cwd="/c",
+        ) == 0
+
+    def test_returns_zero_when_cli_dir_missing(self, tmp_path):
+        assert relocate_records(
+            tmp_path, "claude",
+            old_path="a", new_path="b", new_cwd="/c",
+        ) == 0

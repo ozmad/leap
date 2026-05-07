@@ -20,7 +20,7 @@ leap                             # Interactive: choose CLI + session name
 src/
 ├── scripts/                     # Entry point scripts
 │   ├── leap-main.sh          # Main launcher (called by 'leap' command)
-│   ├── leap-resume.py        # `leap --resume` picker — CLI-agnostic; each row is shown as `[cli] tag` and resumes via the provider's `resume_args(id)`
+│   ├── leap-resume.py        # `leap --resume` picker — CLI-agnostic; each row is shown as `[cli] tag` and resumes via the provider's `resume_args(id)`. When the picked session was recorded under a different cwd than the current shell, calls `provider.relocate_session(...)` to move the on-disk transcript so the resume can run in the *current* cwd without a manual `cd` (Claude only today)
 │   ├── leap-hook-process.py  # Hook processor invoked by `leap-hook.sh`; shared across all CLIs. Handles stdin parsing, session recording via `provider.extract_session_id()`, and last-assistant-message extraction for Slack
 │   ├── leap-cleanup.sh       # Dead session cleanup
 │   ├── _leap                 # zsh completion for user-facing flags (conditional --slack)
@@ -57,7 +57,8 @@ src/
     │   ├── line_buffer.py       # Cursor-aware line editing buffer (used by raw-terminal input prompts)
     │   ├── menu.py              # `MENU_OPTION_RE` + `extract_menu_options()` — single source of truth for parsing numbered TUI menus from corrupted pyte snapshots; used by both server (auto-approve / select_option) and monitor (right-click options menu)
     │   ├── socket_utils.py      # Shared Unix socket send/recv helper
-    │   └── resume_store.py      # Shared read/write/prune of `cli_sessions/<cli>/<tag>.json` (used by hook + picker)
+    │   ├── resume_store.py      # Shared read/write/prune of `cli_sessions/<cli>/<tag>.json` (used by hook + picker); plus `relocate_records()` for rewriting transcript paths after a cross-cwd move
+    │   └── claude_session_move.py  # Atomic, signal-blocked relocation of `~/.claude/projects/<slug>/<uuid>.jsonl` (+ optional `<uuid>/` sidecar dir) across cwds — used by `leap --resume` when the picked session was recorded in a different directory than the user's current cwd
     │
     ├── server/                  # PTY Server
     │   ├── server.py            # LeapServer - main orchestrator
@@ -199,6 +200,9 @@ assets/
 | `OutputCapture` | `slack/output_capture.py` | Read hook response from signal file, write .last_response |
 | `LineBuffer` | `utils/line_buffer.py` | Cursor-aware line editing buffer (insert, delete, move, home/end, delete-word) used by raw-terminal prompts |
 | `extract_menu_options()` | `utils/menu.py` | Numbered-menu parser shared by server auto-approve and monitor permission menu — tolerates pyte snapshot corruption (missing periods, garbage cursor prefixes) |
+| `relocate_claude_session()` | `utils/claude_session_move.py` | Atomic copy + verify (SHA-256) + atomic rename + delete of a Claude session's JSONL and optional sidecar directory across cwds. Critical signals (SIGINT/SIGTERM/SIGHUP/SIGQUIT/SIGTSTP) blocked for the whole move via `pthread_sigmask`. Source is never deleted until destination is verified in place; rolls back the JSONL commit if the sidecar rename fails. Caller's `on_committed` callback runs after dst is committed but before src is deleted, inside the same blocked section, so bookkeeping stays consistent with the move. |
+| `relocate_records()` | `utils/resume_store.py` | Walks every `cli_sessions/<cli>/*.json` and rewrites entries whose `transcript_path` matches the old path, without bumping `last_seen` (the SessionStart hook does that on the next resume). Atomic per-file. |
+| `CLIProvider.relocate_session()` | `cli_providers/base.py` | Optional provider hook — returns the new transcript path on success, `None` if the CLI doesn't support cross-cwd relocation (caller falls back to `chdir`). Today only `ClaudeProvider` overrides it. |
 | `_resolve_cli_flags()` | `server/pty_handler.py` | Merge stored/env-var default flags with explicit CLI flags; used by `PTYHandler.spawn()` |
 | `send_socket_request()` | `utils/socket_utils.py` | Shared Unix socket send/recv utility |
 | `resolve_scm_token()` | `monitor/pr_tracking/config.py` | Resolve token from config (supports env var mode) |
