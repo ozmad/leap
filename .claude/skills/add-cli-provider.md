@@ -168,6 +168,7 @@ Override these only if the CLI differs from the defaults:
 | `requires_binary_for_hooks` | `False` | Set `True` if hooks should only configure when CLI is installed |
 | `valid_signal_states` | `SIGNAL_STATES` | Override if the CLI writes different states to signal files |
 | `supports_resume` | `False` | Set `True` when you wire up the **Leap Resume** feature (see below) |
+| `requires_cwd_bound_resume` | `False` | Set `True` if resuming this CLI requires running from the recorded cwd (see **Cross-cwd resume — the "move" mechanism** below). Drives the picker's *Original / Current* prompt. |
 
 #### Optional Methods (Have Defaults)
 
@@ -183,6 +184,8 @@ Override these only if the CLI differs from the defaults:
 | `parse_signal_file()` | Parses JSON `{"state": "..."}` | Different signal file format |
 | `extract_session_id()` | Returns `None` (no resume) | Implement for **Leap Resume** — pull the session id out of the hook payload |
 | `resume_args()` | Returns `[]` | Implement for **Leap Resume** — return the argv tokens that resume the given session id |
+| `relocate_session()` | Returns `None` (no cross-cwd) | Implement for the **move mechanism** — physically (or logically) bring the session's on-disk state under the user's chosen cwd. Required when `requires_cwd_bound_resume = True`. |
+| `session_exists()` | Returns `True` | Override if your CLI records sessions with empty `transcript_path` so the picker's path-based stale-check can't filter them — return `False` when the session's on-disk state has been deleted out-of-band. |
 
 ### Leap Resume feature (`leap --resume`)
 
@@ -258,6 +261,148 @@ transcript.
   `export LEAP_PROJECT_DIR="…"` line out of `~/.zshrc` / `~/.bashrc`.
   You get this for free by using `get_spawn_env` (base class) without
   overriding it.
+
+### Cross-cwd resume — the "move" mechanism
+
+When the user picks a session in `leap --resume` (or via the GUI's
+"From Resume" / "Open IDE + Move session" flows) from a *different*
+cwd than the one the session was originally recorded in, leap shows
+an arrow-key prompt:
+
+```
+  Where do you want to resume?
+  ❯ CD into the original directory:  /Users/me/work/proj
+    Stay in the current directory:   /Users/me
+```
+
+**Both options must work for every CLI we ship.** This requires every
+new resume-capable provider to implement the *move mechanism*:
+
+1. **`requires_cwd_bound_resume`** → `True`
+   This flips on the prompt above.  When `False`, leap silently uses
+   the current cwd (no prompt) — only correct for CLIs whose resume
+   command finds sessions by id alone, regardless of cwd.
+
+2. **`relocate_session(session_id, src_cwd, dst_cwd, *, transcript_path='', on_committed=None) -> Optional[str]`**
+   Called when the user picks **"Stay in the current directory"**.
+   Must bring the session's on-disk state under `dst_cwd` so
+   `<cli> resume <id>` finds it from there.  Two flavors:
+
+   - **File-move (real)** — for CLIs that store sessions in a
+     cwd-derived path: physically move the transcript / chat dir
+     across cwds.  Use the shared primitives in
+     `src/leap/utils/relocation.py` (`signals_blocked`,
+     `stage_copy_file/_tree`, `commit_file/_tree`,
+     `verify_files_match`, `must_remove_tree`, `make_tmp_path`).
+     Wrap your orchestrator function in its own
+     `<name>_session_move.py` next to the existing
+     `claude_session_move.py` / `gemini_session_move.py` /
+     `cursor_session_move.py`.
+
+   - **Logical no-op** — for CLIs that key sessions by UUID alone
+     (Codex): no files move.  Just call `on_committed(transcript_path)`
+     so leap's recorded cwd in
+     `.storage/cli_sessions/<name>/<tag>.json` is bumped immediately,
+     and return the unchanged `transcript_path` so the caller treats
+     it as a successful relocation.  Skip the file-move primitives
+     and the signal-blocking — there's nothing critical to protect.
+
+   Return value contract:
+   - **non-`None` string** (the new path, or unchanged path for
+     logical moves) → success, caller sets `target_cwd = dst_cwd`.
+   - **`None`** → not applicable / can't be located; caller falls
+     through to chdir into `src_cwd` (the "Original" path still works).
+   - **Raise `RelocationError`** → real disk-side failure; caller
+     surfaces the message to the user and exits non-zero.  Source must
+     be intact when this raises.
+
+3. **Reference behavior the four built-in providers exhibit** —
+   pick the one your CLI most resembles and copy the shape:
+
+   | Provider | Storage layout | What `relocate_session` does |
+   |----------|----------------|-----------------------------|
+   | `ClaudeProvider` | `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` (+ optional `<uuid>/` sidecar dir) | Atomic move of the JSONL **and** the sidecar tree across cwd-derived slugs.  Pre-flight slug check, rogue-writer snapshot guards on both file and tree, rollback on sidecar-rename failure. |
+   | `GeminiProvider` | `~/.gemini/tmp/<slug>/chats/session-…jsonl` + `~/.gemini/projects.json` registry mapping `cwd → slug` | Locate src by parsing first-line `sessionId` (filename embeds only an 8-char prefix), claim a fresh dst slug via Gemini's exact `slugify(basename(cwd))` algorithm with `-N` disambiguation, atomically update `projects.json`, roll back the file commit if the registry write fails. |
+   | `CursorAgentProvider` | `~/.cursor/chats/<MD5(workspace)>/<chatId>/` (whole directory tree) | Move the full chat dir across MD5 hash dirs.  `find_chat_dir` first tries `MD5(prefer_cwd)` then falls back to scanning every project hash dir for the chatId — cursor's workspace-root walk may have hashed a parent of the recorded cwd.  Snapshot-based rogue-writer guard + best-effort prune of the now-empty src project hash dir. |
+   | `CodexProvider` | `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` (date+UUID, **cwd-agnostic**) | **No file move.**  Just calls `on_committed(transcript_path)` so leap's recorded cwd is bumped immediately.  Also returns `['-C', os.getcwd(), 'resume', session_id]` from `resume_args` so codex's *own* "Choose working directory to resume" prompt doesn't fire on top of leap's prompt. |
+
+4. **`session_exists(session_id, cwd) -> bool`** *(only if your CLI's
+   records have empty `transcript_path`)*
+   The picker's stale-record filter normally checks
+   `os.path.getsize(transcript_path)` — if your CLI doesn't expose a
+   transcript path (e.g. Cursor records `transcript_path: ""`), that
+   check can't fire and stale records linger forever.  Override
+   `session_exists` to do a cheap on-disk check (e.g. Cursor's
+   `find_chat_dir` scans `~/.cursor/chats/<hash>/<id>/`); the picker
+   will hide records that return `False`.
+
+**You get these for free — no code needed, but worth knowing:**
+
+- *Records bookkeeping by `session_id`.*  `relocate_records()` in
+  `leap.utils.resume_store` rewrites every `cli_sessions/<cli>/<tag>.json`
+  entry matching a given `session_id` — not by `transcript_path`, which
+  would silently no-op for empty-path records like Cursor's.  The
+  shared `_on_committed` callback in `leap-resume.py` calls it for
+  you; you just need to invoke `on_committed(new_path)` from your
+  `relocate_session`.  Pass the new path for real moves, the
+  unchanged path for logical no-op moves, or `''` if your CLI doesn't
+  track transcript paths.
+- *Hard-fail on dropped resume.*  When `LEAP_RESUME_SESSION_ID` is
+  set but the resume can't be honored (unknown provider, no
+  `supports_resume`, `--cli` mismatch, etc.), `leap-server.py` exits
+  non-zero with a yellow `✗ Refusing to start` stderr message
+  instead of silently starting a fresh session — `_apply_resume_or_fail`
+  handles this centrally.  Just make sure your `supports_resume`
+  accurately reflects whether `relocate_session` + `resume_args` are
+  actually implemented.
+
+**TL;DR — minimum overrides for a new resume-capable CLI:**
+
+```python
+from typing import Any, Optional
+
+class MyCLIProvider(CLIProvider):
+    @property
+    def supports_resume(self) -> bool:
+        return True
+
+    @property
+    def requires_cwd_bound_resume(self) -> bool:
+        # True for CLIs whose ``<cli> resume <id>`` only finds the
+        # session when run from the recorded cwd; False for ones that
+        # find sessions by id alone (e.g. Codex).
+        return True
+
+    def extract_session_id(self, hook_data: dict) -> Optional[str]:
+        ...  # pull the session id from the hook payload
+
+    def resume_args(self, session_id: str) -> list[str]:
+        ...  # build the argv tokens that resume <session_id>
+
+    def relocate_session(
+        self,
+        session_id: str,
+        src_cwd: str,
+        dst_cwd: str,
+        *,
+        transcript_path: str = '',
+        on_committed: Optional[Any] = None,
+    ) -> Optional[str]:
+        # File-move flavor (like Claude/Gemini/Cursor):
+        #   write src/leap/utils/<name>_session_move.py using the
+        #   relocation.py primitives and call into it here.
+        # Logical no-op flavor (like Codex):
+        #   if on_committed is not None and transcript_path:
+        #       on_committed(transcript_path)
+        #   return transcript_path or None
+        ...
+
+    def session_exists(self, session_id: str, cwd: str) -> bool:
+        # Only override if your CLI's records have empty
+        # transcript_path (so the picker's path-based stale filter
+        # can't see them).  Default returns True.
+        ...
+```
 
 ### 2. Register the Provider
 
@@ -503,6 +648,12 @@ class TestMyCliProvider:
 - [ ] `hook_config_dir` points to correct location
 - [ ] `requires_binary_for_hooks` set correctly
 - [ ] **Leap Resume** feature wired (if the CLI supports resume): `supports_resume`, `extract_session_id`, `resume_args` — or explicitly decide to skip
+- [ ] **Cross-cwd resume / move mechanism** wired (only when `supports_resume = True`):
+      - [ ] `requires_cwd_bound_resume` set correctly (`True` if the CLI's resume needs cwd to match its recorded path)
+      - [ ] `relocate_session()` implemented — file-move (Claude/Gemini/Cursor pattern) **or** logical no-op (Codex pattern, just calls `on_committed`)
+      - [ ] If file-move: created `src/leap/utils/<name>_session_move.py` using the shared `relocation.py` primitives (`signals_blocked`, `stage_copy_*`, `commit_*`, `must_remove_tree`, `make_tmp_path`)
+      - [ ] `session_exists()` overridden if your CLI's records have empty `transcript_path`
+      - [ ] Verified the *Original* and *Current* picker options both produce a working resume (manually test from a cwd different than the recorded one)
 
 ### Shell & Makefile
 - [ ] Shell launcher script created (`src/scripts/<name>-leap-main.sh`)
