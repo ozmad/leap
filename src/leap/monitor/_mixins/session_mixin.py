@@ -101,11 +101,15 @@ class SessionMixin(_Base):
             elif not (pin.get('remote_project_path')
                       or tag in self._tracked_tags
                       or tag in self._checking_tags
-                      or tag in self._starting_tags):
+                      or tag in self._starting_tags
+                      or tag in self._moving_tags):
                 # Dead row with no PR tracking — schedule for removal.
-                # ``_starting_tags`` is honored so a freshly-added row
-                # (From Local Path → Open Directly, From Resume) isn't
-                # wiped between the pin and the launcher reading it.
+                # Several escape hatches honor in-flight transitions:
+                # ``_starting_tags`` covers freshly-added rows (From
+                # Local Path → Open Directly, From Resume); ``_moving_tags``
+                # covers Move-to-IDE where the old server is being killed
+                # to start a new one under the same tag — we want the
+                # row's color/alias/order preserved across that gap.
                 tags_to_remove.append(tag)
                 continue
             else:

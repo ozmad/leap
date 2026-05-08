@@ -213,6 +213,15 @@ class MonitorWindow(
         self._pinned_sessions: dict[str, dict[str, Any]] = load_pinned_sessions()
         self._deleted_tags: set[str] = set()  # suppress re-pin after explicit delete
         self._starting_tags: set[str] = set()  # guard against double-click server start
+        # Move-to-IDE protection: row preserved across the close-old-server →
+        # launch-IDE → start-new-server transition.  Distinct from
+        # ``_starting_tags`` because that set is auto-cleared on every refresh
+        # for any currently-alive tag, which would race with our close — we'd
+        # add to it while the old server is alive, the next 1s auto-refresh
+        # tick would clear it, and the dead-row would be wiped on the merge
+        # right after.  ``_moving_tags`` has no auto-clear; entries are removed
+        # only by the explicit safety-net timeout in ``_move_session_to_ide``.
+        self._moving_tags: set[str] = set()
         self._ui_ready = False  # suppress resizeEvent during init
         self._state_changed_at: dict[str, tuple[str, float]] = {}  # tag -> (state, timestamp)
         self._dismissed_new_status: set[str] = set()  # tags where user dismissed fire icon

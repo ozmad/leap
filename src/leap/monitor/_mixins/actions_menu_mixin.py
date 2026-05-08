@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING, Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QDialog, QFileDialog, QHBoxLayout, QLabel, QMenu, QMessageBox,
     QPushButton, QVBoxLayout,
@@ -447,6 +447,30 @@ class ActionsMenuMixin(_Base):
             verb = 'Resuming' if _sid else 'Starting'
             self._show_status(f"{verb} '{_tag}' in {label}")
 
+        # Bridge the dead-row gap: between ``_close_server`` finishing
+        # and the IDE-launched ``leap <tag>`` registering a new active
+        # session, ``_merge_sessions`` would see "no live server, no PR
+        # tracking" and wipe the row's pin — losing color, alias, and
+        # ``row_order`` position; the new server would then re-pin as a
+        # fresh row at the bottom of the table.
+        #
+        # We use ``_moving_tags`` (not ``_starting_tags``) because the
+        # latter is auto-cleared on every refresh for any tag whose
+        # server is currently alive — and at this exact moment the old
+        # server *is* still alive, so a 1 s auto-refresh tick during
+        # the close would clear it before close completes.  The
+        # ``_moving_tags`` set has no auto-clear; we explicitly drop the
+        # tag after a 60 s safety-net timeout.  When the new server
+        # registers as active, ``_merge_sessions`` merges normally;
+        # ``_moving_tags`` becomes a no-op for that tag (it only matters
+        # in the dead-row branch).  60 s is comfortable for slow JetBrains
+        # cold starts; if the IDE fails to launch, the row falls into
+        # the normal dead-row removal path after the timeout — same
+        # end state as today.
+        self._moving_tags.add(_tag)
+        QTimer.singleShot(
+            60_000, lambda: self._moving_tags.discard(_tag),
+        )
         # Close the server (same path as the X button), then run our
         # follow-up.  ``_from_delete=True`` skips _close_server's own
         # confirmation popups (we already asked "Move?").

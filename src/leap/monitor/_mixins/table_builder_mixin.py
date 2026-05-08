@@ -1017,7 +1017,13 @@ class TableBuilderMixin(_Base):
                                          row, self.COL_QUEUE)
 
                 # ── Server button + close button ───────────────────
-                starting = tag in self._starting_tags if is_dead else False
+                # Show "Starting..." for dead rows that are mid-transition
+                # — either freshly launched (``_starting_tags``) or being
+                # moved from one terminal to another (``_moving_tags``,
+                # the Move-to-IDE close→relaunch flow).
+                starting = is_dead and (
+                    tag in self._starting_tags or tag in self._moving_tags
+                )
                 branch_mismatch = bool(
                     not is_dead
                     and pinned_data.get('remote_project_path')
