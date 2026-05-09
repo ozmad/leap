@@ -110,6 +110,7 @@ class TestOnSend:
     def test_on_send_clears_interrupt_pending(self, tmp_path: Path) -> None:
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
+        tracker.on_send()  # → running (Esc only arms flag in non-IDLE)
         tracker.on_input(b'\x1b')  # Escape → interrupt pending
         assert tracker._interrupt_pending is True
         tracker.on_send()
@@ -237,17 +238,85 @@ class TestSignalFile:
 # ---------------------------------------------------------------------------
 
 class TestInterruptPendingFlag:
-    def test_escape_sets_interrupt_pending(self, tmp_path: Path) -> None:
+    def test_escape_in_running_sets_interrupt_pending(self, tmp_path: Path) -> None:
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
+        tracker.on_send()  # → running
         tracker.on_input(b'\x1b')
         assert tracker._interrupt_pending is True
 
-    def test_ctrl_c_sets_interrupt_pending(self, tmp_path: Path) -> None:
+    def test_ctrl_c_in_running_sets_interrupt_pending(self, tmp_path: Path) -> None:
+        t = [0.0]
+        tracker = make_tracker(tmp_path, t)
+        tracker.on_send()  # → running
+        tracker.on_input(b'\x03')
+        assert tracker._interrupt_pending is True
+
+    def test_escape_in_idle_does_not_set_interrupt_pending(
+        self, tmp_path: Path,
+    ) -> None:
+        """Esc in IDLE has no interrupt semantics — the CLI just clears
+        its input box.  Without this guard, ambient ``Interrupted``
+        substrings in conversational scrollback (e.g. the literal word
+        in a previous reply) could combine with the sticky flag and
+        false-trigger INTERRUPTED on the next on_output."""
+        t = [0.0]
+        tracker = make_tracker(tmp_path, t)
+        tracker.on_input(b'\x1b')
+        assert tracker._interrupt_pending is False
+        assert tracker.current_state == 'idle'
+
+    def test_ctrl_c_in_idle_does_not_set_interrupt_pending(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same as Esc — Ctrl+C in IDLE shouldn't arm interrupt detection."""
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
         tracker.on_input(b'\x03')
-        assert tracker._interrupt_pending is True
+        assert tracker._interrupt_pending is False
+        assert tracker.current_state == 'idle'
+
+    def test_idle_with_ambient_interrupted_text_stays_idle(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression: the bug we're fixing — ambient text containing
+        the substring ``Interrupted`` (capitalised, matching Claude's
+        ``interrupted_pattern``) is on the pyte screen, the user
+        accidentally presses Esc at the idle prompt, the next on_output
+        runs ``_handle_idle_output`` which checks ``_interrupt_pending
+        and pattern in compact``.  Under the old code the flag was set
+        unconditionally and the false-trigger fired.  Under the new
+        code Esc in IDLE leaves the flag at False so the transition
+        is impossible.
+
+        The wording mirrors the real bug report — a Claude reply that
+        referred to "Interrupted state" / "Interrupted by user" while
+        analysing this very issue."""
+        t = [0.0]
+        tracker = make_tracker(tmp_path, t)
+        # Mark seen_user_input so _handle_idle_output runs the interrupt
+        # path (the startup-dialog branch returns early otherwise).
+        tracker.on_input(b'x')
+        feed_screen_text(
+            tracker,
+            'Discussing Interrupted state and how the suppression flag '
+            'gates re-entry from stale Interrupted text in scrollback.',
+        )
+        # Sanity: the substring is present at this point.
+        with tracker._screen_lock:
+            screen = tracker._get_screen_text()
+        compact = screen.replace(' ', '').replace('\n', '')
+        assert 'Interrupted' in compact
+
+        tracker.on_input(b'\x1b')
+        # Re-feed to trigger another _handle_idle_output pass.
+        feed_screen_text(
+            tracker,
+            'Discussing Interrupted state and how the suppression flag '
+            'gates re-entry from stale Interrupted text in scrollback.',
+        )
+        assert tracker.current_state == 'idle'
+        assert tracker._interrupt_pending is False
 
     def test_regular_input_does_not_set_interrupt_pending(self, tmp_path: Path) -> None:
         t = [0.0]
@@ -517,14 +586,22 @@ class TestInterruptPatternOnScreen:
         feed_screen_text(tracker, 'Interrupted')
         assert tracker.current_state == 'running'
 
-    def test_interrupted_in_idle_with_flag(self, tmp_path: Path) -> None:
+    def test_idle_esc_does_not_trigger_interrupted(
+        self, tmp_path: Path,
+    ) -> None:
+        """Under Option A, Esc in IDLE no longer arms the interrupt
+        flag — so the pattern appearing afterward cannot drive a false
+        idle→interrupted transition.  This is the exact regression
+        path that bit users when conversational scrollback contained
+        the substring ``interrupted`` (e.g. "Re: your interrupted
+        question") and an accidental Esc was pressed at the prompt."""
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
         tracker.on_input(b'x')  # seen user input
-        tracker.on_input(b'\x1b')  # interrupt pending
-        # Stop hook already raced ahead to idle, now PTY shows pattern
+        tracker.on_input(b'\x1b')  # Esc in IDLE — flag stays False
         feed_screen_text(tracker, 'Interrupted')
-        assert tracker.current_state == 'interrupted'
+        assert tracker.current_state == 'idle'
+        assert tracker._interrupt_pending is False
 
     def test_needs_input_corrected_to_interrupted(self, tmp_path: Path) -> None:
         t = [0.0]
@@ -845,7 +922,9 @@ class TestStaleInterruptSuppression:
         feed_screen_text(tracker, 'Normal idle prompt')
         assert tracker._suppress_stale_interrupt is False
 
-        # Now a real interrupt should be detected
+        # Now a real interrupt should be detected once the user is
+        # actually running again (Esc only arms the flag in non-IDLE).
+        tracker.on_send()  # → running
         tracker.on_input(b'\x1b')
         feed_screen_text(tracker, 'Interrupted')
         assert tracker.current_state == 'interrupted'
@@ -866,6 +945,7 @@ class TestOnInputFiltering:
     def test_single_escape_accepted(self, tmp_path: Path) -> None:
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
+        tracker.on_send()  # → running (Esc only arms flag in non-IDLE)
         tracker.on_input(b'\x1b')
         assert tracker._interrupt_pending is True
 
@@ -880,6 +960,7 @@ class TestOnInputFiltering:
         """Ctrl+C bundled with text in one on_input call."""
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
+        tracker.on_send()  # → running (Ctrl+C only arms flag in non-IDLE)
         tracker.on_input(b'hello\x03')
         assert tracker._interrupt_pending is True
         assert tracker._seen_user_input is True
@@ -888,6 +969,7 @@ class TestOnInputFiltering:
         """CSI u Escape sequence embedded in multi-byte data (not at pos 0)."""
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
+        tracker.on_send()  # → running (Esc only arms flag in non-IDLE)
         # Typed "hi" then pressed Escape via kitty protocol
         tracker.on_input(b'hi\x1b[27u')
         assert tracker._interrupt_pending is True
@@ -906,6 +988,7 @@ class TestOnInputFiltering:
         """Focus event followed by Ctrl+C — both must be handled."""
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
+        tracker.on_send()  # → running (Ctrl+C only arms flag in non-IDLE)
         tracker.on_input(b'\x1b[I\x03')
         assert tracker._interrupt_pending is True
         assert tracker._seen_user_input is True
@@ -1274,8 +1357,9 @@ class TestStaleScreenContent:
         the pyte screen must not cause false interrupted state when
         user presses Escape later.
 
-        This was a critical bug: pyte screen retained historical content
-        across transitions, unlike the old _output_buf which was cleared.
+        Under the IDLE-state-gate design Esc in IDLE never even arms
+        ``_interrupt_pending``, so the false-trigger window is closed
+        regardless of what's on the pyte screen.
         """
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
@@ -1283,7 +1367,7 @@ class TestStaleScreenContent:
 
         # Phase 1: Real interrupt cycle
         tracker.on_send()  # → running
-        tracker.on_input(b'\x1b')  # interrupt pending
+        tracker.on_input(b'\x1b')  # interrupt pending (state RUNNING)
         feed_screen_text(tracker, 'Interrupted')
         assert tracker.current_state == 'interrupted'
 
@@ -1292,14 +1376,15 @@ class TestStaleScreenContent:
         write_signal(tracker, 'idle')
         tracker.get_state(pty_alive=True)  # → idle (clears screen)
 
-        # Phase 3: Accidental Escape in idle
-        tracker.on_input(b'\x1b')  # interrupt pending
-        assert tracker._interrupt_pending is True
+        # Phase 3: Accidental Escape in idle — flag stays False (Option A
+        # gates flag-set on state != IDLE).  Even if the screen still
+        # carried the stale "Interrupted" substring, no transition would
+        # fire because the gate is unarmed.
+        tracker.on_input(b'\x1b')
+        assert tracker._interrupt_pending is False
 
-        # New output arrives — screen should NOT contain stale "Interrupted"
         t[0] = 5.0
         feed_screen_text(tracker, 'Normal idle output')
-        # Should stay idle — "Interrupted" is not on the fresh screen
         assert tracker.current_state == 'idle'
 
     def test_screen_reset_on_running_to_idle(self, tmp_path: Path) -> None:
@@ -1415,7 +1500,11 @@ class TestEscapeDoesNotBlockAutoResume:
         self, tmp_path: Path,
     ) -> None:
         """Escape/Ctrl+C should not set _user_input_since_idle,
-        so auto-resume cursor detection is not blocked."""
+        so auto-resume cursor detection is not blocked.
+
+        Under Option A, Esc in IDLE also leaves ``_interrupt_pending``
+        at False — so neither flag interferes with auto-resume.
+        """
         t = [0.0]
         tracker = make_tracker(tmp_path, t)
         tracker.on_input(b'x')  # seen user input
@@ -1424,17 +1513,14 @@ class TestEscapeDoesNotBlockAutoResume:
         tracker.get_state(pty_alive=True)  # → idle, clears _user_input_since_idle
         assert tracker._user_input_since_idle is False
 
-        # Escape should NOT set _user_input_since_idle
+        # Escape in IDLE: neither flag should be touched.
         tracker.on_input(b'\x1b')
         assert tracker._user_input_since_idle is False
-        assert tracker._interrupt_pending is True
+        assert tracker._interrupt_pending is False
 
         # Auto-resume should still work (detected at poll time)
         t[0] = 5.0
         feed_with_hidden_cursor(tracker, 'Auto processing')
-        # Need to clear signal file first (interrupt pending would
-        # redirect idle signal to interrupted)
-        tracker._signal_file.unlink(missing_ok=True)
         assert tracker.get_state(pty_alive=True) == 'running'
 
     def test_ctrl_c_does_not_block_auto_resume(

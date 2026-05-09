@@ -266,7 +266,11 @@ class CLIStateTracker:
         """Called when the user types in the server terminal.
 
         Handles:
-        - Escape/Ctrl+C → sets _interrupt_pending
+        - Escape/Ctrl+C in non-IDLE states → sets _interrupt_pending
+          (IDLE has nothing to interrupt — the CLI just clears its
+          input box.  Setting the flag in IDLE would let ambient
+          ``Interrupted`` substrings in conversational scrollback
+          false-trigger the INTERRUPTED state on the next on_output.)
         - Enter in IDLE → transitions to RUNNING
         - Any input in WAITING_STATES → sets _user_responded
         - CSI u protocol (kitty keyboard) for Ctrl+C/Escape
@@ -367,7 +371,18 @@ class CLIStateTracker:
             )
             return
 
-        if is_interrupt:
+        # Only arm the flag when there's actually something to interrupt.
+        # Esc/Ctrl+C in IDLE has no semantic effect on Claude (the prompt
+        # box just clears) — but with the flag set, any subsequent on_output
+        # whose compact screen contains the substring "Interrupted" (e.g.
+        # the literal word in conversation, code, or commit messages) would
+        # false-trigger the idle→interrupted transition guarded by
+        # `_interrupt_pending and not _suppress_stale_interrupt` in
+        # `_handle_idle_output`.  Also neutralises chunk-split arrow-keys
+        # (\x1b alone arriving as the tail of a read, before the [A
+        # continuation lands) when the user is at the idle prompt
+        # navigating history.
+        if is_interrupt and self._state != CLIState.IDLE:
             self._interrupt_pending = True
             _log.debug('ON_INPUT _interrupt_pending=True')
 
