@@ -23,6 +23,7 @@ _leap() {
     opts=(
         '(-h --help)'{-h,--help}'[show help]'
         '--update[update Leap to the latest version]'
+        '--reconfigure[re-wire Leap after installing a new CLI/IDE/terminal]'
         '--manage-clis[manage CLI providers (order, flags, visibility, custom CLIs)]'
         '--resume[resume a previous session in its original CLI]'
     )

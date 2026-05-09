@@ -96,6 +96,9 @@ class CustomCLIProvider(CLIProvider):
     def configure_hooks(self, hook_script_path: str) -> None:
         self._base.configure_hooks(hook_script_path)
 
+    def hooks_installed(self) -> bool:
+        return self._base.hooks_installed()
+
     # -- Overridden methods ----------------------------------------------
 
     def get_spawn_env(

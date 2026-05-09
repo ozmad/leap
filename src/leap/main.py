@@ -8,6 +8,7 @@ import sys
 
 from leap.client import LeapClient
 from leap.server import LeapServer
+from leap.server.server import _enforce_hooks_installed_or_exit
 from leap.utils.constants import SOCKET_DIR
 
 
@@ -31,6 +32,11 @@ def main() -> None:
 
     if not socket_path.exists():
         flags = [arg for arg in sys.argv[2:] if arg.startswith('--')]
+        # Same gate as leap-server.py:main() — refuse to spawn the
+        # server when Leap's hooks aren't wired up for this CLI (no
+        # --cli arg here, so the gate falls back to the default
+        # provider, claude).
+        _enforce_hooks_installed_or_exit(None)
         server = LeapServer(tag, flags=flags)
         server.run()
     else:

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from leap.cli_providers.base import CLIProvider
+from leap.utils.atomic_write import atomic_write_json
 from leap.utils.claude_session_move import relocate_claude_session
 from leap.utils.menu import MENU_OPTION_RE
 
@@ -281,10 +282,44 @@ class ClaudeProvider(CLIProvider):
             make_entry("idle", matcher="resume"),
         ])
 
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(settings_path, "w") as f:
-            json.dump(settings, f, indent=2)
-            f.write("\n")
+        atomic_write_json(settings_path, settings)
+
+    def hooks_installed(self) -> bool:
+        """True iff ``~/.claude/hooks/leap-hook.sh`` exists AND
+        ``~/.claude/settings.json`` references it from any hook entry.
+
+        Wrapped in a broad try/except so any unexpected shape in the
+        settings file (e.g. a ``command`` that's a non-string scalar)
+        returns False instead of crashing the session-start gate.
+        """
+        try:
+            hook_script = self.hook_config_dir / "leap-hook.sh"
+            if not hook_script.is_file():
+                return False
+            settings_path = Path.home() / ".claude" / "settings.json"
+            with open(settings_path, "r") as f:
+                settings = json.load(f)
+            hooks = settings.get("hooks") if isinstance(settings, dict) else None
+            if not isinstance(hooks, dict):
+                return False
+            for entries in hooks.values():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    inner = entry.get("hooks")
+                    if not isinstance(inner, list):
+                        continue
+                    for h in inner:
+                        if not isinstance(h, dict):
+                            continue
+                        cmd = h.get("command")
+                        if isinstance(cmd, str) and "leap-hook.sh" in cmd:
+                            return True
+            return False
+        except Exception:
+            return False
 
     # -- CLI-specific input behaviors ------------------------------------
 

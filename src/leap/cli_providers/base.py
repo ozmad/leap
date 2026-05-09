@@ -46,6 +46,25 @@ class CLIProvider(ABC):
         """Check whether the CLI binary is available on PATH."""
         return shutil.which(self.command) is not None
 
+    @property
+    def base_type(self) -> str:
+        """Built-in CLI this provider is a variant of.
+
+        Returns one of ``'claude'`` / ``'codex'`` / ``'cursor-agent'`` /
+        ``'gemini'``.  All custom CLIs are variants of one of the four
+        built-in providers — they share the same hook-config dir and
+        settings-file layout, so the gate at session start can use the
+        base provider's ``hooks_installed()`` rather than requiring every
+        custom author to re-implement that check.
+
+        Built-in providers return their own ``name`` (the default
+        implementation below).  ``CustomCLIProvider`` doesn't override
+        this — it inherits the base's value via ``__getattribute__``
+        delegation, so a custom wrapper around ``ClaudeProvider``
+        automatically reports ``base_type == 'claude'``.
+        """
+        return self.name
+
     # -- State detection patterns ----------------------------------------
 
     @property
@@ -346,6 +365,27 @@ class CLIProvider(ABC):
 
         Args:
             hook_script_path: Absolute path to the leap-hook.sh script.
+        """
+
+    @abstractmethod
+    def hooks_installed(self) -> bool:
+        """Return True iff Leap's hooks are wired up for this CLI.
+
+        Mirror image of :meth:`configure_hooks` — checks both that the
+        hook script exists at ``hook_config_dir / 'leap-hook.sh'`` AND
+        that the CLI's settings file references it.  Both halves must
+        be present; if either is missing or the settings file is
+        unreadable / malformed, return False (not raise).
+
+        Used by the session-start gate to detect "user installed this
+        CLI after Leap" (or "user wiped their config") and point them
+        at ``leap --reconfigure`` before the server spawns.
+
+        The check is intentionally lenient about *which* hook entries
+        are present — any single entry whose ``command`` references
+        ``leap-hook.sh`` counts.  This way, adding new hook events to
+        ``configure_hooks()`` later doesn't retroactively flag older
+        installs as broken.
         """
 
     # -- CLI binary lookup -----------------------------------------------

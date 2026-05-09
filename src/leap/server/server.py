@@ -92,14 +92,10 @@ class LeapServer:
 
         # Validate against monitor pinned sessions (PR-pinned rows).
         # Release the startup lock on failure so another server can start.
-        lock_dir = SOCKET_DIR / f"{tag}.server.lock"
         try:
             validate_pinned_session(tag, STORAGE_DIR)
         except SystemExit:
-            try:
-                lock_dir.rmdir()
-            except OSError:
-                pass
+            self._release_startup_lock()
             raise
 
         # Initialize paths
@@ -3293,8 +3289,71 @@ def main() -> None:
         if not cli_name:
             cli_name = resume_cli
 
+    # Gate: refuse to start if Leap's hooks aren't wired up for this CLI.
+    # Hooks drive session tracking, /resume, Slack output capture, and
+    # permission detection — without them the session would silently
+    # misbehave.  Custom CLIs are variants of one of the four base CLIs
+    # (claude / codex / cursor-agent / gemini); we check the *base*
+    # provider's hooks_installed() since they share its hook-config dir.
+    _enforce_hooks_installed_or_exit(cli_name, tag=tag)
+
     server = LeapServer(tag, flags=flags, cli=cli_name)
     server.run()
+
+
+def _release_server_lock(tag: Optional[str]) -> None:
+    """Best-effort release of ``<tag>.server.lock`` from ``SOCKET_DIR``.
+
+    Used by every code path in ``main()`` that exits non-zero before
+    ``LeapServer(...)`` is instantiated.  ``leap-main.sh`` acquires the
+    lock dir and registers a bash trap to clean it up on exit, but
+    that trap is gone after ``exec`` replaces the bash process with
+    Python — so any ``sys.exit(1)`` here would leak the lock without
+    this manual rmdir.  ``LeapServer.__init__`` does the same on
+    ``validate_pinned_session`` failures.
+    """
+    if not tag:
+        return
+    try:
+        (SOCKET_DIR / f"{tag}.server.lock").rmdir()
+    except OSError:
+        pass
+
+
+def _enforce_hooks_installed_or_exit(
+    cli_name: Optional[str], *, tag: Optional[str] = None,
+) -> None:
+    """Block server start when the picked CLI's hooks aren't wired up.
+
+    Typically means the CLI was installed after Leap (so install-time
+    hook configuration silently skipped it).  Print a clear remediation
+    pointing at ``leap --reconfigure`` and exit with code 1.
+    """
+    try:
+        provider = get_provider(cli_name)
+        base = get_provider(provider.base_type)
+    except ValueError:
+        # Unknown provider (or a custom CLI whose base_type points at a
+        # missing built-in — should be impossible if the registry is
+        # consistent, but cheap to guard).  Let LeapServer surface the
+        # canonical error so we don't double-emit the same diagnostic.
+        return
+    if base.hooks_installed():
+        return
+    _release_server_lock(tag)
+    yellow = "\033[33m"
+    bold = "\033[1m"
+    reset = "\033[0m"
+    name = provider.display_name
+    sys.stderr.write(
+        f"\n  {yellow}✗ Leap's hooks aren't configured for {name}.{reset}\n\n"
+        f"  This usually means {name} was installed after Leap.\n"
+        f"  Without hooks, session tracking, /resume, Slack output, and\n"
+        f"  permission detection won't work for this CLI.\n\n"
+        f"  Fix:\n"
+        f"      {bold}leap --reconfigure{reset}\n\n"
+    )
+    sys.exit(1)
 
 
 def _apply_resume_or_fail(
@@ -3329,6 +3388,7 @@ def _apply_resume_or_fail(
             f"manually — re-run `leap --resume` to pick a session.\n",
             file=sys.stderr,
         )
+        _release_server_lock(tag)
         sys.exit(1)
 
     if cli_name and cli_name != resume_cli:
@@ -3340,6 +3400,7 @@ def _apply_resume_or_fail(
             f"  Either drop --cli or unset LEAP_RESUME_*.\n",
             file=sys.stderr,
         )
+        _release_server_lock(tag)
         sys.exit(1)
 
     try:
@@ -3353,6 +3414,7 @@ def _apply_resume_or_fail(
             f"a recent Leap update.\n",
             file=sys.stderr,
         )
+        _release_server_lock(tag)
         sys.exit(1)
 
     if not provider.supports_resume:
@@ -3362,6 +3424,7 @@ def _apply_resume_or_fail(
             f"  Cannot apply resume {short} for tag '{tag}'.\n",
             file=sys.stderr,
         )
+        _release_server_lock(tag)
         sys.exit(1)
 
 

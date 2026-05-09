@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 from leap.cli_providers.base import CLIProvider
 from leap.cli_providers.states import SIGNAL_STATES
+from leap.utils.atomic_write import atomic_write_json, atomic_write_text
 
 
 # Codex hooks.json schema:
@@ -323,24 +324,78 @@ class CodexProvider(CLIProvider):
 
         raw["hooks"] = events
 
-        # Write hooks file
-        CODEX_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CODEX_HOOKS_FILE, "w") as f:
-            json.dump(raw, f, indent=2)
-            f.write("\n")
+        # Write hooks file atomically (temp + fsync + rename) so a
+        # concurrent reader (the session-start gate) never sees a
+        # half-written file mid-rewrite.
+        atomic_write_json(CODEX_HOOKS_FILE, raw)
+
+    def hooks_installed(self) -> bool:
+        """True iff all three pieces of Codex's hook setup are present:
+        the hook script in ``~/.codex/``, a ``leap-hook.sh`` reference
+        in ``hooks.json``, AND the ``codex_hooks`` feature flag in
+        ``config.toml`` (without the flag, Codex silently ignores
+        hooks.json).
+
+        Wrapped in a broad try/except so any unexpected shape in the
+        settings files returns False instead of crashing the gate.
+        """
+        try:
+            hook_script = self.hook_config_dir / "leap-hook.sh"
+            if not hook_script.is_file():
+                return False
+            # Feature flag in config.toml — without it, hooks never fire.
+            config_file = CODEX_CONFIG_DIR / "config.toml"
+            config_text = config_file.read_text() if config_file.exists() else ""
+            if "codex_hooks" not in config_text:
+                return False
+            # Reference in hooks.json (under the nested "hooks" key — flat
+            # form is silently ignored by Codex 0.121+, so we treat it as
+            # not-installed too).
+            with open(CODEX_HOOKS_FILE, "r") as f:
+                raw = json.load(f)
+            events = raw.get("hooks") if isinstance(raw, dict) else None
+            if not isinstance(events, dict):
+                return False
+            for entries in events.values():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    inner = entry.get("hooks")
+                    if not isinstance(inner, list):
+                        continue
+                    for h in inner:
+                        if not isinstance(h, dict):
+                            continue
+                        cmd = h.get("command")
+                        if isinstance(cmd, str) and "leap-hook.sh" in cmd:
+                            return True
+            return False
+        except Exception:
+            return False
 
     @staticmethod
     def _ensure_hooks_feature_flag() -> None:
-        """Ensure features.codex_hooks = true in ~/.codex/config.toml."""
+        """Ensure features.codex_hooks = true in ~/.codex/config.toml.
+
+        Read-modify-write done atomically (read existing, concat new
+        block, atomic-write the union) so a concurrent reader (the
+        session-start gate calling :meth:`hooks_installed`) never
+        sees a half-appended config file mid-rewrite.
+        """
         config_file = CODEX_CONFIG_DIR / "config.toml"
-        CODEX_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         config_text = ''
         if config_file.exists():
             config_text = config_file.read_text()
         if 'codex_hooks' in config_text:
             return
-        with open(config_file, 'a') as f:
-            f.write('\n[features]\ncodex_hooks = true\nsuppress_unstable_features_warning = true\n')
+        new_text = (
+            config_text
+            + '\n[features]\ncodex_hooks = true\n'
+            + 'suppress_unstable_features_warning = true\n'
+        )
+        atomic_write_text(config_file, new_text)
 
     # -- CLI-specific input behaviors ------------------------------------
 

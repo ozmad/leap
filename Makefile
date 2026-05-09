@@ -455,6 +455,31 @@ update-deps: .env
 	@echo "$(PROMPT_PREFIX) Updating dependencies only (no code pull)..."
 	@poetry update
 
+# Re-run the per-machine integration steps without pulling code or
+# rebuilding heavy artifacts.  Use this after installing a new CLI,
+# IDE, or terminal post-Leap (the install-time configures skipped
+# whatever wasn't on disk).  Idempotent and safe to re-run.
+#
+# In scope: migration (no-op for Leap users), install-metadata refresh,
+# shell config (only the fenced Leap block), all five IDE/terminal
+# configures, CLI hooks.
+# Out of scope: git pull, poetry install, monitor rebuild, Slack deps.
+.PHONY: reconfigure
+reconfigure:
+	@echo "$(PROMPT_PREFIX) Re-configuring Leap..."
+	@$(MAKE) .migrate-from-claudeq
+	@$(MAKE) write-install-metadata
+	@$(MAKE) .detect-shell-update
+	@$(MAKE) .configure-vscode
+	@$(MAKE) .configure-cursor
+	@$(MAKE) .configure-jetbrains
+	@$(MAKE) .configure-iterm2
+	@$(MAKE) .configure-wezterm
+	@$(MAKE) .configure-hooks
+	@echo ""
+	@echo "$(GREEN)✓ Leap re-configured$(NC)"
+	@echo "  Reload your shell if .zshrc/.bashrc was updated: source ~/.zshrc"
+
 # Internal targets
 
 .PHONY: .env

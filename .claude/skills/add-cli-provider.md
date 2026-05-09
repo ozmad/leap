@@ -129,7 +129,16 @@ class <Name>Provider(CLIProvider):
         # 1. Load the CLI's config file (JSON, TOML, YAML, etc.)
         # 2. Remove any old Leap hook entries (marker: "leap-hook.sh")
         # 3. Add new entries that call hook_script_path with state args
-        # 4. Write the config back
+        # 4. Write the config back ATOMICALLY (use leap.utils.atomic_write)
+
+    def hooks_installed(self) -> bool:
+        """True iff Leap's hooks are wired up for this CLI."""
+        # Mirror image of configure_hooks(). Both halves must be true:
+        # 1. self.hook_config_dir / "leap-hook.sh" exists on disk
+        # 2. The CLI's settings file references "leap-hook.sh" from any
+        #    hook entry. Wrap parse in try/except — corrupt or missing
+        #    files return False (do NOT raise).
+        # See ClaudeProvider or CodexProvider for reference impls.
         ...
 ```
 
@@ -145,7 +154,8 @@ These MUST be implemented — the class won't instantiate without them:
 | `interrupted_pattern` | `bytes` | Text indicating user interrupted the CLI |
 | `dialog_patterns` | `list[bytes]` | Patterns indicating a permission/input dialog |
 | `hook_config_dir` | `Path` | Directory for hook script installation |
-| `configure_hooks()` | method | Installs hooks into CLI config |
+| `configure_hooks()` | method | Installs hooks into CLI config (use atomic writes) |
+| `hooks_installed()` | method | Returns True iff Leap's hooks are currently wired up — used by the session-start gate to refuse to spawn the server when integration is missing (e.g. CLI installed after Leap). Mirror image of `configure_hooks()` |
 
 #### Optional Properties (Have Defaults)
 
@@ -166,6 +176,7 @@ Override these only if the CLI differs from the defaults:
 | `image_prefix` | `'@'` | Change if CLI uses different image attachment syntax |
 | `supports_image_attachments` | `False` | Set `True` if CLI supports inline image files |
 | `requires_binary_for_hooks` | `False` | Set `True` if hooks should only configure when CLI is installed |
+| `base_type` | `self.name` | For **built-in** providers, leave the default — it returns the provider's own `name`. **Custom** providers (`CustomCLIProvider`) inherit the value from their wrapped base automatically via `__getattribute__` delegation; you don't write `base_type` yourself. The session-start gate uses `get_provider(provider.base_type).hooks_installed()` so custom CLIs share their base's hook setup. **All custom CLIs must wrap one of the four base CLIs** — there is no path for a custom CLI that's not a variant of a built-in. |
 | `valid_signal_states` | `SIGNAL_STATES` | Override if the CLI writes different states to signal files |
 | `supports_resume` | `False` | Set `True` when you wire up the **Leap Resume** feature (see below) |
 | `requires_cwd_bound_resume` | `False` | Set `True` if resuming this CLI requires running from the recorded cwd (see **Cross-cwd resume — the "move" mechanism** below). Drives the picker's *Original / Current* prompt. |
@@ -434,7 +445,7 @@ __all__ = [
 
 ### 4. Hook Configuration
 
-The `configure_hooks()` method on your provider class IS the hook configuration. The unified `src/scripts/configure_hooks.py` script automatically discovers all registered providers and calls their `configure_hooks()` method during `make install` and `make update`.
+The `configure_hooks()` method on your provider class IS the hook configuration. The unified `src/scripts/configure_hooks.py` script automatically discovers all registered providers and calls their `configure_hooks()` method during `make install`, `make update`, and `make reconfigure`.
 
 **What your `configure_hooks()` must do:**
 
@@ -443,14 +454,48 @@ The `configure_hooks()` method on your provider class IS the hook configuration.
 3. Add entries that call the hook script with state arguments:
    - **Stop hook**: `<hook_path> idle` — Called when CLI finishes processing
    - **Notification hooks** (if supported): `<hook_path> needs_permission`, `<hook_path> needs_input`
-4. Write the config back
+4. Write the config back **atomically** — use `atomic_write_json()` (or `atomic_write_text()`) from `leap.utils.atomic_write`. The session-start gate reads these settings files concurrently and a non-atomic write can leave a half-truncated file mid-rewrite, which would make `hooks_installed()` return False and falsely block the user.
 
 **The hook script** (`leap-hook.sh`) is shared across all CLIs. It:
 - Reads `LEAP_TAG` and `LEAP_SIGNAL_DIR` env vars (set by `get_spawn_env()`)
 - Writes `{"state": "<state>"}` to `.storage/sockets/<tag>.signal`
 - For idle state, also extracts the last assistant message from the transcript
 
-If your CLI doesn't support hooks at all, you can implement a no-op `configure_hooks()`, but state detection will rely entirely on PTY output patterns and silence timeout, which is less reliable.
+If your CLI doesn't support hooks at all, you can implement a no-op `configure_hooks()`, but state detection will rely entirely on PTY output patterns and silence timeout, which is less reliable. **You'll still need to implement `hooks_installed()` returning `True` unconditionally** so the session-start gate doesn't block the user.
+
+**`hooks_installed()` — mirror image of `configure_hooks()`:**
+
+The session-start gate (in `leap-server.py:_enforce_hooks_installed_or_exit`) calls `provider.hooks_installed()` before spawning the server. If it returns False, the server refuses to start and points the user at `leap --reconfigure`. This catches the "user installed the CLI after Leap" case (where install-time hook config was skipped because the binary wasn't on PATH yet) plus generic "user wiped their settings file" recovery.
+
+**Implementation pattern (wrap the whole body in a broad try/except):**
+
+```python
+def hooks_installed(self) -> bool:
+    try:
+        hook_script = self.hook_config_dir / "leap-hook.sh"
+        if not hook_script.is_file():
+            return False
+        with open(<your settings file>, "r") as f:
+            data = json.load(f)            # or tomllib.load, etc.
+        # Walk your CLI's hook config defensively.  Use isinstance()
+        # checks at every nesting level — a third-party tool or a
+        # hand-edit could leave a valid-JSON-but-wrong-shape file
+        # (e.g. ``"command": null`` or ``"hooks": "stringy"``), and
+        # the `in` operator on a non-string raises TypeError.
+        ...
+        return False
+    except Exception:
+        return False
+```
+
+**Critical rules for `hooks_installed()`:**
+
+- Both halves must be true: hook script exists AND settings file references it. Either alone isn't enough (a stale settings file pointing at a wiped script is still broken).
+- **Never raise.** Wrap the entire body in `try: ... except Exception: return False`. The gate calls `hooks_installed()` on the hot path of `leap <tag>` — a traceback there would crash the session with no useful remediation, while returning False at least fires the gate's friendly error pointing at `leap --reconfigure`. `BaseException` (KeyboardInterrupt, SystemExit) deliberately propagates.
+- Lenient hook-entry check: any single entry referencing `leap-hook.sh` counts. Do NOT require specific events (Stop / Notification / etc.) — that would break older installs whenever new events are added to `configure_hooks()`.
+- **`isinstance()` at every nesting level.** Don't trust the JSON shape — `data.get("hooks")` could be a list, `entry.get("command")` could be `None` or an int. Always check before iterating or doing `in` checks.
+
+**Custom (user-defined) CLIs** inherit `hooks_installed()` from their base provider via `CustomCLIProvider.__getattribute__`'s delegation — there's also an explicit `def hooks_installed(self): return self._base.hooks_installed()` on `CustomCLIProvider` to satisfy `ABCMeta` (the abstract-method check happens at class-creation time, before delegation can kick in). Custom-CLI authors don't write either method themselves; they pass `base_provider=ClaudeProvider()` (or one of the other three) to `CustomCLIProvider.__init__` and `base_type` follows automatically. **All custom CLIs are variants of one of the four base CLIs** — this is a hard constraint of the project.
 
 ### 5. Optional: Shell Launcher Script
 
@@ -589,6 +634,7 @@ print(list_providers())
 p = get_provider('<name>')
 print(f'{p.name}: {p.display_name}, cmd={p.command}')
 print(f'hook_dir={p.hook_config_dir}, requires_binary={p.requires_binary_for_hooks}')
+print(f'base_type={p.base_type}, hooks_installed={p.hooks_installed()}')
 "
 ```
 
@@ -597,6 +643,8 @@ print(f'hook_dir={p.hook_config_dir}, requires_binary={p.requires_binary_for_hoo
 ```bash
 PYTHONPATH=src:$PYTHONPATH poetry run python src/scripts/configure_hooks.py <name> src/scripts/leap-hook.sh
 ```
+
+After running this, `provider.hooks_installed()` must flip from `False` to `True`. If it doesn't, your `hooks_installed()` and `configure_hooks()` aren't symmetric — the gate at session start will block users with no recovery (running `leap --reconfigure` would re-run `configure_hooks()`, which still wouldn't satisfy `hooks_installed()`).
 
 ### 3. Run Existing Tests
 
@@ -644,7 +692,9 @@ class TestMyCliProvider:
 - [ ] All abstract properties and methods implemented
 - [ ] Provider registered in `registry.py`
 - [ ] Provider exported in `__init__.py`
-- [ ] `configure_hooks()` installs hooks correctly
+- [ ] `configure_hooks()` installs hooks correctly **and writes atomically** (use `leap.utils.atomic_write`)
+- [ ] `hooks_installed()` is the symmetric inverse of `configure_hooks()` — both halves checked, never raises, lenient on which hook events are present
+- [ ] After running `configure_hooks()`, `hooks_installed()` flips to `True`
 - [ ] `hook_config_dir` points to correct location
 - [ ] `requires_binary_for_hooks` set correctly
 - [ ] **Leap Resume** feature wired (if the CLI supports resume): `supports_resume`, `extract_session_id`, `resume_args` — or explicitly decide to skip

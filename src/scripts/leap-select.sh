@@ -15,6 +15,9 @@ fi
 if [ "$1" = "--update" ]; then
     exec "$SCRIPT_DIR/leap-main.sh" "$@"
 fi
+if [ "$1" = "--reconfigure" ]; then
+    exec "$SCRIPT_DIR/leap-main.sh" "$@"
+fi
 if [ "$1" = "--slack" ]; then
     exec "$SCRIPT_DIR/leap-main.sh" "$@"
 fi

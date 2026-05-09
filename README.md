@@ -28,6 +28,8 @@ source ~/.zshrc  # ~/.bashrc on Linux
 
 Already installed? Run `leap --update` to pull the latest version and rebuild. If the update command fails, `cd` into the project directory and run `make update`.
 
+Installed a new CLI / IDE / terminal **after** Leap? Run `leap --reconfigure` so Leap wires its hooks and IDE/terminal settings into the newly-installed tool. (`make install` skips anything that wasn't on disk at the time, so newly-installed tools start without integration.)
+
 ### Upgrading from ClaudeQ
 
 The project was renamed from **ClaudeQ** (`claudeq`) to **Leap** (`leap`). If you have an existing ClaudeQ installation:

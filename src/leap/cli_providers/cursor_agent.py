@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from leap.cli_providers.base import CLIProvider
 from leap.cli_providers.states import SIGNAL_STATES
+from leap.utils.atomic_write import atomic_write_json
 from leap.utils.cursor_session_move import find_chat_dir, relocate_cursor_session
 
 
@@ -277,10 +278,40 @@ class CursorAgentProvider(CLIProvider):
             "command": f"{hook_script_path} idle",
         })
 
-        CURSOR_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CURSOR_HOOKS_FILE, "w") as f:
-            json.dump(hooks_data, f, indent=2)
-            f.write("\n")
+        atomic_write_json(CURSOR_HOOKS_FILE, hooks_data)
+
+    def hooks_installed(self) -> bool:
+        """True iff ``~/.cursor/leap-hook.sh`` exists AND
+        ``~/.cursor/hooks.json`` references it from any hook entry.
+
+        Cursor's schema is flatter than Claude/Gemini — entries are
+        ``{"command": "..."}`` directly, with no nested ``"hooks"``
+        list, and event names are lowercase.
+
+        Wrapped in a broad try/except so any unexpected shape in the
+        settings file returns False instead of crashing the gate.
+        """
+        try:
+            hook_script = self.hook_config_dir / "leap-hook.sh"
+            if not hook_script.is_file():
+                return False
+            with open(CURSOR_HOOKS_FILE, "r") as f:
+                data = json.load(f)
+            hooks = data.get("hooks") if isinstance(data, dict) else None
+            if not isinstance(hooks, dict):
+                return False
+            for entries in hooks.values():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    cmd = entry.get("command")
+                    if isinstance(cmd, str) and HOOK_MARKER in cmd:
+                        return True
+            return False
+        except Exception:
+            return False
 
     # -- CLI binary lookup -----------------------------------------------
 

@@ -42,6 +42,14 @@ if [ "$1" = "--update" ]; then
     exec "$SCRIPT_DIR/leap-update.sh" --skip-if-current "$PROJECT_DIR"
 fi
 
+# Re-wire Leap integrations after installing a new CLI/IDE/terminal.
+# Doesn't pull, install deps, or rebuild the monitor — just re-runs
+# the per-machine configures (hooks + IDE/terminal settings + shell
+# block) so newly-installed tools get picked up.
+if [ "$1" = "--reconfigure" ]; then
+    exec make -C "$PROJECT_DIR" reconfigure
+fi
+
 # Manage CLI order if requested
 if [ "$1" = "--manage-clis" ]; then
     PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}" \
@@ -104,6 +112,7 @@ USAGE:
     leap <tag> [--flags]              Start server with flags (passed to CLI)
     leap --help, -h                   Show this help
     leap --update                     Update Leap to latest version
+    leap --reconfigure                Re-wire Leap after installing a new CLI/IDE/terminal
     leap --manage-clis                Manage CLI providers (order, flags, visibility, custom CLIs)
     leap --resume                     Pick a previous Leap session and resume it in its original CLI
 EOF

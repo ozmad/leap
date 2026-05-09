@@ -12,7 +12,11 @@ source ~/.zshrc             # Reload shell
 leap mytag                       # Terminal 1: Select CLI + start server
 leap mytag                       # Terminal 2: Connect client
 leap                             # Interactive: choose CLI + session name
+
+leap --reconfigure               # After installing a new CLI/IDE/terminal post-Leap
 ```
+
+**Installed a new CLI / IDE / terminal after Leap?** Run `leap --reconfigure`. The install-time configures (`make install`) skip anything that wasn't on disk at the time, so newly-installed tools have no hook integration. The session-start gate in `leap-server.py` will refuse to spawn the server for a CLI whose hooks aren't wired up, with a stderr error pointing here.
 
 ## Project Structure
 
@@ -218,6 +222,10 @@ assets/
 | `CLIProvider.requires_cwd_bound_resume` | `cli_providers/base.py` | Property — `True` for CLIs whose storage is cwd-derived (Claude, Gemini, Cursor) so `<cli> --resume <id>` only finds the session under the matching cwd. `False` (default) for Codex which keys sessions by UUID alone. Drives whether `leap-resume.py` shows the "Original / Current" cwd-choice prompt. |
 | `CLIProvider.session_exists()` | `cli_providers/base.py` | Hook — `True` (default) for CLIs that record `transcript_path` (the picker filters via existence check on the path). Override returns `False` when the CLI's session is gone from disk; used today only by `CursorAgentProvider` (records have empty `transcript_path`, so we scan `~/.cursor/chats/<hash>/<id>/` directly). Wired into `resume_store.load_raw_tag_rows` via `_filter_provider_stale`. |
 | `CLIProvider.relocate_session()` | `cli_providers/base.py` | Optional provider hook — returns the new transcript path on success, `None` if the CLI doesn't support cross-cwd relocation. Implemented today by `ClaudeProvider`, `GeminiProvider`, and `CursorAgentProvider`. Codex inherits the base `None` (sessions are UUID-keyed, cwd-agnostic). |
+| `CLIProvider.hooks_installed()` | `cli_providers/base.py` | Abstract — return `True` iff Leap's hooks are wired up for this CLI (script in `hook_config_dir` AND a `leap-hook.sh` reference in the CLI's settings file). Mirror image of `configure_hooks()`. Used by the session-start gate (`leap-server.py:_enforce_hooks_installed_or_exit`) to refuse to spawn the server when hooks aren't configured (typically: CLI installed after Leap), pointing the user at `leap --reconfigure`. Custom CLIs inherit via `CustomCLIProvider`'s delegation, so they don't need their own implementation — the gate uses `get_provider(provider.base_type).hooks_installed()`. **Must never raise** — every implementation wraps its body in `try: ... except Exception: return False` to defend against weird-but-valid JSON shapes (a `command: 42` or `hooks: "stringy"` would otherwise crash the gate with `TypeError`). `BaseException` (KeyboardInterrupt, SystemExit) deliberately propagates. |
+| `CLIProvider.base_type` | `cli_providers/base.py` | Property — built-in CLI this provider is a variant of. Built-ins return their own `name` (default impl: `return self.name`). Custom providers (`CustomCLIProvider`) inherit the base's value via `__getattribute__` delegation — so a custom Claude wrapper's `base_type` is automatically `'claude'` because `CustomCLIProvider(_base=ClaudeProvider()).base_type` resolves to `ClaudeProvider().base_type`, which is `'claude'`. The session-start gate uses `get_provider(provider.base_type).hooks_installed()` so custom CLIs share their base's hook setup automatically. **All custom CLIs are variants of one of the four base CLIs — there is no path for a custom CLI that's not built atop one.** |
+| `atomic_write_json()` | `utils/atomic_write.py` | Write JSON to a temp file in the same dir, fsync, atomic rename. Used by every provider's `configure_hooks()` so a concurrent reader (the session-start gate calling `hooks_installed()`) never sees a half-truncated settings file mid-rewrite. |
+| `_enforce_hooks_installed_or_exit()` | `server/server.py` | Session-start gate — called from `leap-server.py:main()` after `cli_name` is finalised but before `LeapServer(...)` is instantiated. Looks up `provider.base_type` and calls the base's `hooks_installed()`; if False, prints a friendly stderr error pointing at `leap --reconfigure` and exits with code 1. No env-var bypass — the only escape is to actually configure the hooks. |
 | `_resolve_cli_flags()` | `server/pty_handler.py` | Merge stored/env-var default flags with explicit CLI flags; used by `PTYHandler.spawn()` |
 | `send_socket_request()` | `utils/socket_utils.py` | Shared Unix socket send/recv utility |
 | `resolve_scm_token()` | `monitor/pr_tracking/config.py` | Resolve token from config (supports env var mode) |
@@ -280,7 +288,9 @@ Type `^^` in the server terminal to queue a message. Double-caret (`^^`) activat
 
 ## Adding Features
 
-- **New CLI provider** → See the `.claude/skills/add-cli-provider.md` skill for a comprehensive step-by-step guide. Key files: create `cli_providers/<name>.py`, register in `registry.py`, implement `configure_hooks()`. The CLI selector, monitor table, ASCII banner, and shell flags are all dynamic and require no changes.
+- **New CLI provider** → See the `.claude/skills/add-cli-provider.md` skill for a comprehensive step-by-step guide. Key files: create `cli_providers/<name>.py`, register in `registry.py`, implement `configure_hooks()` and `hooks_installed()` (the latter must be the symmetric inverse of the former — both halves checked, never raises). The CLI selector, monitor table, ASCII banner, and shell flags are all dynamic and require no changes.
+
+  **All custom CLIs are variants of one of the four base CLIs** (Claude / Codex / Cursor Agent / Gemini). `CustomCLIProvider` (in `registry.py`) wraps a base provider and delegates everything via `__getattribute__` — including `hooks_installed()` and `base_type`. Custom-CLI authors don't set `base_type` themselves; they pass `base_provider=ClaudeProvider()` (or one of the other three) to `CustomCLIProvider.__init__`, and `base_type` follows automatically (it resolves to the base's `name` via the `__getattribute__` delegation). The session-start gate uses `get_provider(provider.base_type).hooks_installed()` so custom CLIs share their base's hook setup automatically. There is no path for a custom CLI that's not built atop one of the four — design accordingly.
 - **New monitor dialog / window** → See the `.claude/skills/add-dialog.md` skill. Covers `ZoomMixin` setup, dialog geometry persistence, theme integration, the font-size cascade quirk, and — critically — the **prefs persistence model** (`MonitorWindow._DIALOG_OWNED_KEYS` and why `save_monitor_prefs(self._prefs)` must NOT be called outside `_save_prefs`). Skipping that last part is the most common way dialog state silently gets clobbered.
 
   **`_DIALOG_OWNED_KEYS` rule (read this every time you add a dialog-saved pref):** If a dialog (or any non-`MonitorWindow` code) writes a new key directly to `monitor_prefs.json` via `save_monitor_prefs(prefs)`, you MUST also add that key to `MonitorWindow._DIALOG_OWNED_KEYS` in `app.py` — UNLESS the key ends in `_font_size` or `_font_family` (those are auto-detected by pattern). If you skip this, the dialog's save will appear to work, but `MonitorWindow._save_prefs()` (called on theme change, column resize, window move, zoom, etc.) will overwrite the disk's value with its stale-from-startup cached value. Symptom: "I toggled the checkbox off and reopened the dialog — it's checked again." This has bitten us multiple times. Defaults still aside: for booleans, filters, modes, last-selected names, etc. — explicit list entry is mandatory.
@@ -481,12 +491,15 @@ Bot can also be started/stopped from the monitor's **Slack Bot** button. Depende
 
 **Stale sockets** → `leap-cleanup`
 
+**`✗ Leap's hooks aren't configured for <CLI>` at session start** → The session-start gate (`leap-server.py:_enforce_hooks_installed_or_exit`) ran `provider.base_type`'s `hooks_installed()` and got False. Almost always means the user installed that CLI / IDE / terminal *after* `make install` ran (so install-time hook configuration silently skipped it). Fix: `leap --reconfigure`. Same flag also recovers from "user wiped `~/.<cli>/settings.json`" or any other partial-config drift.
+
 ## Make Commands
 
 ```bash
 make install           # Install core + configure shell
 make install-monitor   # Build and install GUI app
 make install-slack-app # Install Slack integration + setup wizard
+make reconfigure       # Re-run per-machine integration steps (hooks + IDE/terminal/shell configures); skips deps, monitor, slack, git pull. Use after installing a new CLI/IDE/terminal post-Leap. Same target leap --reconfigure execs into.
 make test              # Run the full test suite (unit + integration)
 make test-unit         # Run only fast unit tests
 make test-integration  # Run only real-PTY integration tests

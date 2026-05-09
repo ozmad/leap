@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from leap.cli_providers.base import CLIProvider
+from leap.utils.atomic_write import atomic_write_json
 from leap.utils.gemini_session_move import relocate_gemini_session
 
 
@@ -272,10 +273,42 @@ class GeminiProvider(CLIProvider):
                         name="leap-needs-permission")],
         )
 
-        GEMINI_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(GEMINI_SETTINGS_FILE, "w") as f:
-            json.dump(settings, f, indent=2)
-            f.write("\n")
+        atomic_write_json(GEMINI_SETTINGS_FILE, settings)
+
+    def hooks_installed(self) -> bool:
+        """True iff ``~/.gemini/leap-hook.sh`` exists AND
+        ``~/.gemini/settings.json`` references it from any hook entry.
+
+        Wrapped in a broad try/except so any unexpected shape in the
+        settings file returns False instead of crashing the gate.
+        """
+        try:
+            hook_script = self.hook_config_dir / "leap-hook.sh"
+            if not hook_script.is_file():
+                return False
+            with open(GEMINI_SETTINGS_FILE, "r") as f:
+                settings = json.load(f)
+            hooks = settings.get("hooks") if isinstance(settings, dict) else None
+            if not isinstance(hooks, dict):
+                return False
+            for entries in hooks.values():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    inner = entry.get("hooks")
+                    if not isinstance(inner, list):
+                        continue
+                    for h in inner:
+                        if not isinstance(h, dict):
+                            continue
+                        cmd = h.get("command")
+                        if isinstance(cmd, str) and HOOK_MARKER in cmd:
+                            return True
+            return False
+        except Exception:
+            return False
 
     # -- CLI-specific input behaviors ------------------------------------
 
