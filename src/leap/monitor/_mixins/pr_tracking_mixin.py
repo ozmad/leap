@@ -171,11 +171,18 @@ class PRTrackingMixin(_Base):
             _skip_prompt: If True, skip the confirmation prompt for dead rows
                 (used when called from _remove_pinned_session which has its own).
         """
-        # If server is dead, stopping tracking will remove the row.
-        # Warn so the user can confirm.
+        # If server is dead AND the row has no remaining PR data to
+        # display, stopping tracking will remove the row.  Warn so the
+        # user can confirm.  Rows that still have pinned PR Branch
+        # data (``remote_project_path`` + ``branch``) survive via the
+        # PR Branch keeper — no warning needed, no row removed.
         if not _skip_prompt:
             session = next((s for s in self.sessions if s['tag'] == tag), None)
-            if session and session.get('server_pid') is None:
+            pin = self._pinned_sessions.get(tag, {})
+            has_pr_branch_data = bool(
+                pin.get('remote_project_path') and pin.get('branch'))
+            if (session and session.get('server_pid') is None
+                    and not has_pr_branch_data):
                 reply = QMessageBox.question(
                     self, 'Stop PR Tracking',
                     f"The server for '{tag}' is not running.\n"
@@ -204,10 +211,16 @@ class PRTrackingMixin(_Base):
             pin['pr_tracked'] = False
             save_pinned_sessions(self._pinned_sessions)
 
-        # If server is dead, remove the row entirely
+        # If server is dead AND the row has no remaining PR data
+        # (no PR Branch keeper), remove the row entirely.  Otherwise
+        # let the merge keep it alive — the user kept the PR Branch
+        # cell on purpose and can clear it via its X button.
         session = next((s for s in self.sessions if s['tag'] == tag), None)
         is_dead = session and session.get('server_pid') is None
-        if is_dead and not _skip_prompt:
+        pin = self._pinned_sessions.get(tag, {})
+        has_pr_branch_data = bool(
+            pin.get('remote_project_path') and pin.get('branch'))
+        if is_dead and not _skip_prompt and not has_pr_branch_data:
             # Offer to close the client too
             if session and session.get('has_client', False):
                 client_reply = QMessageBox.question(

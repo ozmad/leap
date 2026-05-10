@@ -405,8 +405,8 @@ Per-provider enable/disable via setup dialog. Polls `get_user_notifications()` e
 
 Rows persist via `pinned_sessions.json`. Key rules:
 - Every active session is auto-pinned on discovery
-- Row survives if it has a running server OR `pr_tracked: True` set in pinned data OR an in-flight transient flag (`_tracked_tags`, `_checking_tags`, `_starting_tags`, `_moving_tags`)
-- Dead rows that are no longer being tracked are auto-removed on the next merge tick (so a row with no PR + no PR Branch + no server never appears in the table)
+- Row survives if it has a running server OR `pr_tracked: True` set in pinned data OR pinned PR Branch data (`remote_project_path` + non-empty `branch`, mirroring the PR Branch column display rule — Stop PR Tracking leaves these in the pin so the X-to-clear UI still works) OR an in-flight transient flag (`_tracked_tags`, `_checking_tags`, `_starting_tags`, `_moving_tags`)
+- Dead rows that are no longer being tracked AND have no displayed PR Branch are auto-removed on the next merge tick (so a row with no PR + no PR Branch + no server never appears in the table)
 - PR auto-reconnects on monitor restart for rows with `pr_tracked: True` — that flag is also what keeps the row alive across the startup window before `_auto_track_pr_pinned` populates `_tracked_tags`/`_checking_tags`
 - `_deleted_tags` set prevents auto-refresh from re-pinning just-deleted rows
 

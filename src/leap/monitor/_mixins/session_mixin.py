@@ -102,7 +102,9 @@ class SessionMixin(_Base):
                       or tag in self._checking_tags
                       or tag in self._starting_tags
                       or tag in self._moving_tags
-                      or pin.get('pr_tracked')):
+                      or pin.get('pr_tracked')
+                      or (pin.get('remote_project_path')
+                          and pin.get('branch'))):
                 # Dead row with no active PR tracking — schedule for removal.
                 # Several escape hatches honor in-flight transitions:
                 # ``_starting_tags`` covers freshly-added rows (From
@@ -116,6 +118,10 @@ class SessionMixin(_Base):
                 # window before ``_auto_track_pr_pinned`` populates
                 # ``_tracked_tags``/``_checking_tags`` (and across
                 # transient SCM provider unavailability).
+                # ``remote_project_path AND branch`` mirrors the PR
+                # Branch column display rule — after Stop PR Tracking
+                # the row still renders the PR Branch (with an X to
+                # clear), so the row must outlive the server too.
                 tags_to_remove.append(tag)
                 continue
             else:
@@ -356,6 +362,8 @@ class SessionMixin(_Base):
                 tag in self._tracked_tags
                 or tag in self._checking_tags
                 or pin.get('pr_tracked')
+                or (pin.get('remote_project_path')
+                    and pin.get('branch'))
             )
             if not has_pr:
                 reply = QMessageBox.question(
