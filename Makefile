@@ -397,8 +397,13 @@ update: .env
 	@# Run ClaudeQ → Leap migration (no-op if already on Leap)
 	@$(MAKE) .migrate-from-claudeq
 	@echo "$(PROMPT_PREFIX) Updating core dependencies..."
-	@$(ENSURE_POETRY2); \
-	poetry install --no-root --without monitor; \
+	@# `&&` (not `;`) so a `poetry install` failure surfaces — with `;`
+	@# the success-line `echo` would still run, swallow poetry's
+	@# non-zero exit, and let make continue into write-install-metadata
+	@# while poetry's venv was in a broken state.  That's the exact
+	@# silent-corruption path that blanked users' venv-path file.
+	@$(ENSURE_POETRY2) && \
+	poetry install --no-root --without monitor && \
 	echo "$(GREEN)✓ Core dependencies updated$(NC)"
 	@$(MAKE) write-install-metadata
 	@echo ""
@@ -408,7 +413,7 @@ update: .env
 		echo ""; \
 		echo "$(PROMPT_PREFIX) Detected Slack integration"; \
 		echo "$(PROMPT_PREFIX) Updating Slack dependencies..."; \
-		poetry install --no-root --with slack; \
+		poetry install --no-root --with slack && \
 		echo "$(GREEN)✓ Slack updated$(NC)"; \
 	else \
 		echo ""; \
@@ -419,8 +424,8 @@ update: .env
 		echo ""; \
 		echo "$(PROMPT_PREFIX) Detected Leap Monitor installation"; \
 		echo "$(PROMPT_PREFIX) Updating monitor dependencies..."; \
-		poetry install --no-root --with monitor; \
-		$(BUILD_MONITOR_APP); \
+		poetry install --no-root --with monitor || exit $$?; \
+		$(BUILD_MONITOR_APP) || exit $$?; \
 		echo "$(GREEN)✓ Monitor updated$(NC)"; \
 		echo ""; \
 		echo "$(YELLOW)Note: macOS revokes Accessibility after app rebuild$(NC)"; \
@@ -435,8 +440,8 @@ update: .env
 		echo "$(PROMPT_PREFIX) Old ClaudeQ Monitor was removed during migration"; \
 		echo "$(PROMPT_PREFIX) Rebuilding as Leap Monitor..."; \
 		rm -f "$(REPO_PATH)/.storage/.migration_had_monitor"; \
-		poetry install --no-root --with monitor; \
-		$(BUILD_MONITOR_APP); \
+		poetry install --no-root --with monitor || exit $$?; \
+		$(BUILD_MONITOR_APP) || exit $$?; \
 		echo "$(GREEN)✓ Leap Monitor installed$(NC)"; \
 		echo ""; \
 		echo "$(YELLOW)Note: macOS requires Accessibility permission for IDE navigation$(NC)"; \
