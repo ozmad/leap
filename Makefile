@@ -239,7 +239,26 @@ ensure-storage:
 .PHONY: write-install-metadata
 write-install-metadata: ensure-storage
 	@echo "$(PROMPT_PREFIX) Writing installation metadata to .storage/..."
-	@poetry env info --path > "$(REPO_PATH)/.storage/venv-path"
+	@# Atomic write: capture poetry output to a temp file in .storage/,
+	@# validate it's a real path that resolves to a python3 binary, then
+	@# rename over the destination.  Without this, a `poetry env info`
+	@# that exits 0 with empty stdout (happens when poetry's tracked
+	@# venv was wiped — e.g. by a Homebrew Python upgrade) silently
+	@# blanks .storage/venv-path, breaking every subsequent `leap` call.
+	@TMP_VP="$$(mktemp "$(REPO_PATH)/.storage/.venv-path.XXXXXX")"; \
+	if poetry env info --path > "$$TMP_VP" 2>/dev/null \
+	   && [ -s "$$TMP_VP" ] \
+	   && [ -x "$$(cat "$$TMP_VP")/bin/python3" ]; then \
+	    mv "$$TMP_VP" "$(REPO_PATH)/.storage/venv-path"; \
+	else \
+	    POETRY_OUT="$$(cat "$$TMP_VP" 2>/dev/null)"; \
+	    rm -f "$$TMP_VP"; \
+	    echo "$(RED)✗ poetry env info --path returned no usable venv$(NC)" >&2; \
+	    echo "  (got: '$$POETRY_OUT' — empty/invalid means poetry's tracked venv is missing)" >&2; \
+	    echo "  Existing .storage/venv-path left unchanged." >&2; \
+	    echo "  Fix: 'poetry env use $(PYTHON_VERSION)' (or 'make install' from scratch), then retry." >&2; \
+	    exit 1; \
+	fi
 	@echo "$(REPO_PATH)" > "$(REPO_PATH)/.storage/project-path"
 	@echo "   Saved venv: $$(cat $(REPO_PATH)/.storage/venv-path)/bin/python3"
 	@echo "   Saved project: $$(cat $(REPO_PATH)/.storage/project-path)"

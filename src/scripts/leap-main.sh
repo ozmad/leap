@@ -17,6 +17,32 @@ if [ -f "$VENV_PATH_FILE" ]; then
     VENV_BASE=$(cat "$VENV_PATH_FILE")
     PYTHON_CMD="$VENV_BASE/bin/python3"
 
+    # Self-heal when venv-path is empty (most often: a previous
+    # `leap --update` ran write-install-metadata while poetry's tracked
+    # venv was missing; `poetry env info --path` exited 0 with empty
+    # stdout, the `>` truncated the file before the empty result was
+    # written, and the rest of the update kept going) or stale (Python
+    # upgraded, venv cache wiped, etc.).  Try poetry once to find the
+    # current venv; on success, atomically rewrite venv-path.
+    if [ -z "$VENV_BASE" ] || [ ! -x "$PYTHON_CMD" ]; then
+        if command -v poetry >/dev/null 2>&1; then
+            REPAIRED=$(cd "$PROJECT_DIR" && poetry env info --path 2>/dev/null)
+            if [ -n "$REPAIRED" ] && [ -x "$REPAIRED/bin/python3" ]; then
+                # Atomic rewrite — temp file in same dir, then rename.
+                # If we crashed mid-write the old (broken) file would
+                # still be readable; never produce a partially-written
+                # venv-path.
+                mkdir -p "$STORAGE_DIR"
+                TMP_VP="$(mktemp "$STORAGE_DIR/.venv-path.XXXXXX")"
+                printf '%s\n' "$REPAIRED" > "$TMP_VP"
+                mv "$TMP_VP" "$VENV_PATH_FILE"
+                VENV_BASE="$REPAIRED"
+                PYTHON_CMD="$VENV_BASE/bin/python3"
+                echo "↺ Repaired stale venv-path (now: $VENV_BASE)" >&2
+            fi
+        fi
+    fi
+
     if [ ! -x "$PYTHON_CMD" ]; then
         echo "❌ Error: Python not found at $PYTHON_CMD" >&2
         echo "   The venv-path file exists but points to an invalid location." >&2
