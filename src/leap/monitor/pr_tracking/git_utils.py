@@ -12,6 +12,58 @@ from leap.monitor.pr_tracking.config import load_github_config, load_gitlab_conf
 logger = logging.getLogger(__name__)
 
 
+# Per-process cache for `ssh -G <host>` results.  Cleared on monitor restart;
+# avoids the subprocess call for every remote-info lookup but doesn't survive
+# changes to ~/.ssh/config across sessions.
+_SSH_HOST_CACHE: dict[str, str] = {}
+
+
+def resolve_ssh_alias(host_fragment: str) -> str:
+    """Resolve an SSH host alias to its real hostname via ``ssh -G``.
+
+    Many users set up aliases in ``~/.ssh/config`` to clone with a specific
+    identity file or jump host (e.g. ``Host planck_gitlab\\n HostName
+    gitlab.com``).  These aliases work over SSH but a literal HTTPS URL
+    built by prefixing ``https://`` to the alias is not DNS-resolvable.
+
+    This helper runs ``ssh -G <alias>`` to read the ``hostname`` line from
+    the resolved config.  Returns the original *host_fragment* if SSH
+    isn't available or the resolution fails — preserving the caller's
+    behaviour for hosts that are already proper DNS names.
+    """
+    if not host_fragment:
+        return host_fragment
+    # If it already looks like a real DNS name (has a dot or is localhost),
+    # don't bother shelling out.  ssh -G would just echo it back.
+    if '.' in host_fragment or host_fragment in ('localhost',):
+        return host_fragment
+    if host_fragment in _SSH_HOST_CACHE:
+        return _SSH_HOST_CACHE[host_fragment]
+    try:
+        result = subprocess.run(
+            ['ssh', '-G', host_fragment],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        _SSH_HOST_CACHE[host_fragment] = host_fragment
+        return host_fragment
+
+    resolved = host_fragment
+    for line in result.stdout.splitlines():
+        # Lines look like 'hostname gitlab.com' — case-insensitive, leading
+        # whitespace possible (different ssh implementations vary slightly).
+        stripped = line.strip()
+        if stripped.lower().startswith('hostname '):
+            candidate = stripped.split(None, 1)[1].strip()
+            # If ssh resolved to the same string we asked for, treat as
+            # "no alias defined" — keep the original.
+            if candidate and candidate.lower() != host_fragment.lower():
+                resolved = candidate
+            break
+    _SSH_HOST_CACHE[host_fragment] = resolved
+    return resolved
+
+
 class SCMType(Enum):
     """Type of source code management platform."""
     GITLAB = "gitlab"
@@ -47,6 +99,21 @@ class ParsedProjectUrl:
     commit: Optional[str] = None  # Commit SHA if parsed from a commit URL
 
 
+def _normalize_host(host_with_creds: str) -> str:
+    """Strip ``user:pass@`` and resolve any SSH alias in *host_with_creds*.
+
+    Used by ``parse_pr_url`` / ``parse_project_url`` so a user who pastes
+    a URL using their SSH alias as the hostname (e.g.
+    ``https://planck_gitlab/...``) gets the same alias-resolution that
+    the local-clone path already does.
+    """
+    host = (
+        host_with_creds.rsplit('@', 1)[-1]
+        if '@' in host_with_creds else host_with_creds
+    )
+    return resolve_ssh_alias(host)
+
+
 def parse_pr_url(
     url: str,
     gitlab_config: Optional[dict[str, Any]] = None,
@@ -69,7 +136,7 @@ def parse_pr_url(
     # GitLab: https://<host>/<project_path>/-/merge_requests/<iid>
     m = re.match(r'https?://([^/]+)/(.+?)/-/merge_requests/(\d+)', url)
     if m:
-        host_url = f"https://{m.group(1)}"
+        host_url = f"https://{_normalize_host(m.group(1))}"
         scm_type = detect_scm_type(host_url, gitlab_config, github_config)
         # URL structure is exclusively GitLab
         if scm_type == SCMType.UNKNOWN:
@@ -84,7 +151,7 @@ def parse_pr_url(
     # GitHub: https://<host>/<owner>/<repo>/pull/<number>
     m = re.match(r'https?://([^/]+)/([^/]+/[^/]+)/pull/(\d+)', url)
     if m:
-        host_url = f"https://{m.group(1)}"
+        host_url = f"https://{_normalize_host(m.group(1))}"
         scm_type = detect_scm_type(host_url, gitlab_config, github_config)
         # URL structure is exclusively GitHub
         if scm_type == SCMType.UNKNOWN:
@@ -190,21 +257,40 @@ def get_git_remote_info(cwd: str) -> Optional[GitRemoteInfo]:
         host_url = None
         project_path = None
 
-        # SSH format: git@gitlab.com:user/project.git
-        ssh_match = re.match(r'git@([^:]+):(.+?)(?:\.git)?$', remote_url)
-        if ssh_match:
-            host_url = f"https://{ssh_match.group(1)}"
-            project_path = ssh_match.group(2)
+        # ssh:// URI format: ssh://git@gitlab.com[:22]/group/project.git
+        # (Port is standardised in ssh:// URIs — explicit and unambiguous.)
+        ssh_uri_match = re.match(
+            r'ssh://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+?)(?:\.git)?/?$',
+            remote_url,
+        )
+        if ssh_uri_match:
+            host_fragment = ssh_uri_match.group(1)
+            project_path = ssh_uri_match.group(2)
+            host_url = f"https://{resolve_ssh_alias(host_fragment)}"
         else:
-            # HTTPS format: https://[user:pass@]host/project.git
-            https_match = re.match(r'https://([^/]+)/(.+?)(?:\.git)?$', remote_url)
-            if https_match:
-                host = https_match.group(1)
-                # Strip credentials (user:pass@) if present
-                if '@' in host:
-                    host = host.rsplit('@', 1)[-1]
-                host_url = f"https://{host}"
-                project_path = https_match.group(2)
+            # scp-style SSH: git@host:path[.git]
+            # NOTE: there is no port-disambiguation in scp-style syntax.
+            # ``git@host:42/repo`` means *path = "42/repo"* — git itself
+            # treats it as such (numeric GitLab groups are valid).  Anyone
+            # who needs a non-default SSH port must use the ssh:// URI form
+            # above, which is unambiguous.  An earlier version of this
+            # regex tried to detect ``:port/path`` here and broke numeric
+            # GitLab groups — don't reintroduce that.
+            ssh_match = re.match(
+                r'git@([^:/]+):(.+?)(?:\.git)?/?$',
+                remote_url,
+            )
+            if ssh_match:
+                host_fragment = ssh_match.group(1)
+                project_path = ssh_match.group(2)
+                host_url = f"https://{resolve_ssh_alias(host_fragment)}"
+            else:
+                # HTTPS format: https://[user:pass@]host/project.git
+                https_match = re.match(
+                    r'https://([^/]+)/(.+?)(?:\.git)?$', remote_url)
+                if https_match:
+                    host_url = f"https://{_normalize_host(https_match.group(1))}"
+                    project_path = https_match.group(2)
 
         if not project_path or not host_url:
             return None
@@ -256,7 +342,7 @@ def parse_project_url(
     # SSH: git@host:group/project[.git]
     m = re.match(r'git@([^:]+):(.+?)(?:\.git)?$', url)
     if m:
-        host_url = f"https://{m.group(1)}"
+        host_url = f"https://{_normalize_host(m.group(1))}"
         project_path = m.group(2).rstrip('/')
         if '/' not in project_path:
             return None
@@ -271,7 +357,7 @@ def parse_project_url(
     if not m:
         return None
 
-    host_url = f"https://{m.group(1)}"
+    host_url = f"https://{_normalize_host(m.group(1))}"
     raw_path = m.group(2).rstrip('/')
 
     # Check for commit URL: /-/commit/<sha> (GitLab) or /commit/<sha> (GitHub)

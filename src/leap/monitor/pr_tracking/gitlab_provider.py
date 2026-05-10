@@ -60,9 +60,23 @@ class GitLabProvider(SCMProvider):
             return None
         try:
             mr = project.mergerequests.get(pr_iid)
+            # For fork MRs the source branch lives in the *source* project
+            # (the fork), not in the base project we got from project_path.
+            # Querying the base project would always 404 and falsely flag
+            # the branch as deleted.  Fall back to the base project when
+            # the source project is unset (fork deleted) or unreachable
+            # (token can't see private fork) — same outcome as before for
+            # those cases.
+            branch_repo = project
+            source_project_id = getattr(mr, 'source_project_id', None)
+            if source_project_id and source_project_id != project.id:
+                try:
+                    branch_repo = self._gl.projects.get(source_project_id)
+                except Exception:
+                    branch_repo = project
             branch_deleted = False
             try:
-                project.branches.get(mr.source_branch)
+                branch_repo.branches.get(mr.source_branch)
             except Exception:
                 branch_deleted = True
             return PRDetails(
@@ -305,7 +319,13 @@ class GitLabProvider(SCMProvider):
             return self._emoji_cache.get(note_id, False)
 
     def _is_bot_author(self, note: dict) -> bool:
-        """Check if a note's author is a bot, with caching via GitLab user API."""
+        """Check if a note's author is a bot, with caching via GitLab user API.
+
+        Only caches the result on a *successful* user-fetch.  Transient
+        failures (network blip, rate limit, 5xx) return False without
+        poisoning the cache — otherwise a single bad lookup early in the
+        session would permanently classify a real bot as human.
+        """
         author = note.get('author', {})
         user_id = author.get('id')
         if user_id is None:
@@ -318,7 +338,8 @@ class GitLabProvider(SCMProvider):
             user = self._gl.users.get(user_id)
             is_bot = getattr(user, 'bot', False)
         except Exception:
-            is_bot = False
+            # Don't cache on failure — retry on next call.
+            return False
 
         self._bot_cache[user_id] = is_bot
         return is_bot
@@ -404,15 +425,25 @@ class GitLabProvider(SCMProvider):
         self, project, project_path: str, mr, discussion, branch: str
     ) -> Optional[CqCommand]:
         """Check a single discussion for a /leap trigger."""
+        # Skip resolved threads — clicking "Resolve thread" should
+        # dismiss any pending /leap (matches our GitHub fix #5).
+        if discussion.attributes.get('resolved', False):
+            return None
+
         notes = discussion.attributes.get('notes', [])
         if not notes:
             return None
 
         # Find the last /leap trigger and last bot acknowledgment.
         # An ack only covers /leap commands that appear before it.
+        # System notes are excluded so an auto-generated body that
+        # happens to contain LEAP_ACK_MESSAGE can't accidentally mark
+        # the thread as acked (#8).
         last_leap_index = -1
         last_ack_index = -1
         for i, note in enumerate(notes):
+            if note.get('system', False):
+                continue
             body = note.get('body', '').strip()
             author = self._note_author(note)
             if body == '/leap' and author == self._username:
@@ -434,15 +465,20 @@ class GitLabProvider(SCMProvider):
                 'created_at': note.get('created_at', ''),
             })
 
-        # Extract code context from the first note's position
+        # Extract code context from the first note that has a position.
+        # System notes (and any other note without position) are skipped
+        # so a leading system note doesn't strip the file:line context
+        # from the message we send to the CLI.
         file_path = None
         old_line = None
         new_line = None
         code_snippet = None
 
-        first_note = notes[0]
-        position = first_note.get('position')
-        if position:
+        first_with_position = next(
+            (n for n in notes if n.get('position')), None,
+        )
+        if first_with_position:
+            position = first_with_position['position']
             file_path = position.get('new_path') or position.get('old_path')
             new_line = position.get('new_line')
             old_line = position.get('old_line')
@@ -561,15 +597,20 @@ class GitLabProvider(SCMProvider):
                 'created_at': note.get('created_at', ''),
             })
 
-        # Extract code context from the first note's position
+        # Extract code context from the first note that has a position.
+        # System notes (and any other note without position) are skipped
+        # so a leading system note doesn't strip the file:line context
+        # from the message we send to the CLI.
         file_path = None
         old_line = None
         new_line = None
         code_snippet = None
 
-        first_note = notes[0]
-        position = first_note.get('position')
-        if position:
+        first_with_position = next(
+            (n for n in notes if n.get('position')), None,
+        )
+        if first_with_position:
+            position = first_with_position['position']
             file_path = position.get('new_path') or position.get('old_path')
             new_line = position.get('new_line')
             old_line = position.get('old_line')
@@ -659,9 +700,15 @@ class GitLabProvider(SCMProvider):
 
     @staticmethod
     def _normalize_gitlab_action(action: str) -> str:
-        """Normalize a GitLab todo action_name to a standard reason."""
+        """Normalize a GitLab todo action_name to a standard reason.
+
+        ``approval_required`` (GitLab Premium) is treated like a review
+        request: same UX, same notification category — the user is being
+        asked to look at and act on the MR.  Free/CE never emits it, so
+        the extra mapping is dead code there.
+        """
         action = action.lower()
-        if action == 'review_requested':
+        if action in ('review_requested', 'approval_required'):
             return 'review_requested'
         elif action == 'assigned':
             return 'assigned'

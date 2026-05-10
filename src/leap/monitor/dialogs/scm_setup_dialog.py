@@ -341,12 +341,21 @@ class SCMSetupDialog(ZoomMixin, QDialog):
     def _is_default_url(self, saved_url: str) -> bool:
         """True if *saved_url* is equivalent to the default (no expand-needed).
 
-        Subclasses can extend this to treat e.g. ``'https://api.github.com'`` as
-        equivalent to the empty string for GitHub, so a user who explicitly
-        typed the API URL on github.com doesn't see "Self-hosted" auto-checked
-        on the next dialog open.
+        Trailing slashes and casing are normalised on both sides before
+        comparison — a user who saved ``'https://gitlab.com/'`` (trailing
+        slash) or ``'HTTPS://gitlab.com'`` (uppercased scheme) shouldn't
+        see "Self-hosted" auto-checked on the next dialog open.  URLs are
+        case-insensitive on scheme+host per RFC 3986 §3.1, and we never
+        compare paths here (default URLs are bare hosts).
+
+        Subclasses can extend this to treat additional URL forms as the
+        default (e.g. GitHub treats ``'https://api.github.com'`` as the
+        default for github.com).
         """
-        return saved_url == self._url_default()
+        return (
+            saved_url.lower().rstrip('/')
+            == self._url_default().lower().rstrip('/')
+        )
 
     def _load_existing(self) -> None:
         config = self._load_config()

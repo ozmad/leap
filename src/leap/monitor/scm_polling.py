@@ -66,6 +66,8 @@ class SCMPollerWorker(QThread):
     notifications_ready = pyqtSignal(list)  # list[UserNotification]
     notification_auth_error = pyqtSignal(str)  # scm_type with 403/auth failure
     leap_ack_failed = pyqtSignal()  # /leap ack post failed (likely token scope issue)
+    leap_send_failed = pyqtSignal(str)  # tag — couldn't deliver /leap to the Leap session
+    leap_send_recovered = pyqtSignal(str)  # tag — delivery succeeded (clear dedup)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -251,12 +253,24 @@ class SCMPollerWorker(QThread):
                     tag = matching_tags[0]
                     message = format_leap_message(cmd)
                     sent = send_to_leap_session(tag, message, preset=auto_preset)
-                    if sent:
-                        logger.debug("/leap from PR !%s sent to session '%s'",
-                                     cmd.pr_iid, tag)
-                    else:
-                        logger.debug("Failed to send /leap message to session '%s'", tag)
-                    # Acknowledge to prevent re-processing
+                    if not sent:
+                        # Don't ack — next poll re-attempts delivery so the
+                        # /leap isn't silently consumed.  Surface a popup so
+                        # the user knows something went wrong (otherwise
+                        # the failure is logged at debug only).
+                        logger.debug("Failed to send /leap message to session '%s' "
+                                     "— skipping ack so next poll retries", tag)
+                        self.leap_send_failed.emit(tag)
+                        continue
+                    logger.debug("/leap from PR !%s sent to session '%s'",
+                                 cmd.pr_iid, tag)
+                    # Tell the main thread to clear any stale "warned"
+                    # dedup entry for this tag — if the session previously
+                    # failed and now recovered, the next failure should
+                    # show a fresh popup instead of being silenced.
+                    self.leap_send_recovered.emit(tag)
+                    # Acknowledge to prevent re-processing now that the
+                    # session has the message.
                     acked = provider.acknowledge_leap_command(
                         cmd.project_path, cmd.pr_iid, cmd.discussion_id
                     )
@@ -369,6 +383,7 @@ class _BaseSendWorker(QThread):
     finished = pyqtSignal(int, str)  # (sent_count, matched_tag)
     error = pyqtSignal(str)  # error_message
     ack_failed = pyqtSignal()  # /leap ack post failed
+    send_partial_failed = pyqtSignal(int, int, str)  # (sent, failed, matched_tag)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -405,6 +420,7 @@ class SendThreadsWorker(_BaseSendWorker):
             return
         try:
             sent_count = 0
+            failed_count = 0
             ack_ok = True
             for cmd in self._commands:
                 message = format_leap_message(cmd)
@@ -416,9 +432,24 @@ class SendThreadsWorker(_BaseSendWorker):
                         ack_ok = False
                     sent_count += 1
                 else:
+                    # Don't ack — next attempt will re-detect this thread as
+                    # unresponded.  Surface the partial failure so the user
+                    # knows the success count doesn't tell the whole story.
+                    failed_count += 1
                     logger.debug("Failed to send thread to session '%s'", self._matched_tag)
 
-            self.finished.emit(sent_count, self._matched_tag)
+            # Emit the appropriate completion signal so the receiver shows
+            # one popup, not two:
+            #   - all good           → finished(sent_count, tag)
+            #   - partial failure    → send_partial_failed(sent, failed, tag)
+            # (The receiver for finished still handles the all-zero case
+            # too; that path doesn't fire send_partial_failed.)
+            if failed_count > 0:
+                self.send_partial_failed.emit(
+                    sent_count, failed_count, self._matched_tag,
+                )
+            else:
+                self.finished.emit(sent_count, self._matched_tag)
             if not ack_ok:
                 self.ack_failed.emit()
         except Exception:

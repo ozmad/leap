@@ -299,6 +299,53 @@ class SCMConfigMixin(_Base):
             return f'{name} connected'
         return f'{name} settings saved'
 
+    def _clear_provider_state(self, scm_value: str) -> None:
+        """Drop in-memory tracking state that belongs to *scm_value*.
+
+        Saving one provider's settings used to wipe ALL providers' PR
+        statuses + tracked tags, so dual-provider users saw GitHub PRs
+        flicker to N/A whenever they touched the GitLab dialog (and vice
+        versa).  This selectively keeps the OTHER provider's state
+        intact.
+
+        Auto-tracked rows whose provider can't be determined (e.g. local
+        path resolves nothing) are cleared conservatively — same
+        behaviour as the old wipe-all path for ambiguous rows.
+        """
+        # Build {tag: provider_value} for tracked rows we can attribute
+        attribution: dict[str, Optional[str]] = {}
+        for tag in list(self._tracked_tags):
+            pinned = self._pinned_sessions.get(tag, {})
+            pinned_type = pinned.get('scm_type')
+            if pinned_type:
+                attribution[tag] = pinned_type
+                continue
+            session = next((s for s in self.sessions if s['tag'] == tag), None)
+            provider = (
+                self._get_provider_for_session(session) if session else None
+            )
+            if provider is None:
+                attribution[tag] = None  # unknown — clear conservatively
+                continue
+            for tname, p in self._scm_providers.items():
+                if p is provider:
+                    attribution[tag] = tname
+                    break
+            else:
+                attribution[tag] = None
+
+        def _affects(tag: str) -> bool:
+            t = attribution.get(tag)
+            return t is None or t == scm_value
+
+        # Apply selective clears
+        affected = {tag for tag in attribution if _affects(tag)}
+        for tag in affected:
+            self._tracked_tags.discard(tag)
+            self._pr_statuses.pop(tag, None)
+            self._pending_tracking_context.pop(tag, None)
+            self._silent_tracking_tags.discard(tag)
+
     def _open_gitlab_setup(self) -> None:
         """Open the GitLab setup dialog."""
         dialog = GitLabSetupDialog(self)
@@ -307,10 +354,7 @@ class SCMConfigMixin(_Base):
             # Disconnect) so in-memory state matches what's now on disk.
             self._scm_poll_timer.stop()
             self._scm_providers.pop(SCMType.GITLAB.value, None)
-            self._pr_statuses.clear()
-            self._tracked_tags.clear()
-            self._pending_tracking_context.clear()
-            self._silent_tracking_tags.clear()
+            self._clear_provider_state(SCMType.GITLAB.value)
             self._init_scm_providers()
             self._auto_track_pr_pinned()
             self._maybe_start_notification_poll()
@@ -324,10 +368,7 @@ class SCMConfigMixin(_Base):
             # Disconnect) so in-memory state matches what's now on disk.
             self._scm_poll_timer.stop()
             self._scm_providers.pop(SCMType.GITHUB.value, None)
-            self._pr_statuses.clear()
-            self._tracked_tags.clear()
-            self._pending_tracking_context.clear()
-            self._silent_tracking_tags.clear()
+            self._clear_provider_state(SCMType.GITHUB.value)
             self._init_scm_providers()
             self._auto_track_pr_pinned()
             self._maybe_start_notification_poll()

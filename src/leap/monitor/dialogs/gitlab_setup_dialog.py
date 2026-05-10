@@ -32,7 +32,10 @@ class GitLabSetupDialog(SCMSetupDialog):
         return 'https://gitlab.com'
 
     def _token_label(self) -> str:
-        return 'Personal Access Token (api scope):'
+        # Personal, Project, and Group access tokens all start with glpat- and
+        # work for the read paths.  Use the umbrella term so users with
+        # project/group tokens don't think they're in the wrong dialog.
+        return 'Access Token (api scope):'
 
     def _token_placeholder(self) -> str:
         return 'glpat-...'
@@ -127,6 +130,12 @@ def _check_gitlab_scopes(gl: Any) -> list[str]:
             warnings.append(
                 'Cannot access Todos API — notification tracking will not work '
                 '(project/group tokens cannot access this endpoint)'
+            )
+        elif status_code == 401:
+            warnings.append(
+                'Token rejected by Todos API (401) — token may have been '
+                'revoked since auth() succeeded.  Notification tracking '
+                'will not work.'
             )
         else:
             logger.debug("Todos probe returned unexpected error", exc_info=True)

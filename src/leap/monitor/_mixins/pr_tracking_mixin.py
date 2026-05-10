@@ -398,6 +398,8 @@ class PRTrackingMixin(_Base):
         worker.notifications_ready.connect(self._on_notifications_received)
         worker.notification_auth_error.connect(self._on_notification_auth_error)
         worker.leap_ack_failed.connect(self._on_leap_ack_failed)
+        worker.leap_send_failed.connect(self._on_leap_send_failed)
+        worker.leap_send_recovered.connect(self._on_leap_send_recovered)
         worker.finished.connect(self._on_scm_worker_finished)
         self._scm_worker = worker
         worker.start()
@@ -557,6 +559,8 @@ class PRTrackingMixin(_Base):
             self._send_threads_worker.finished.connect(self._on_send_threads_finished)
             self._send_threads_worker.error.connect(self._on_send_threads_error)
             self._send_threads_worker.ack_failed.connect(self._on_leap_ack_failed)
+            self._send_threads_worker.send_partial_failed.connect(
+                self._on_send_threads_partial_failure)
             self._send_threads_worker.start()
 
     def _on_send_threads_finished(self, sent_count: int, matched_tag: str) -> None:
@@ -581,6 +585,45 @@ class PRTrackingMixin(_Base):
             QMessageBox.warning(
                 self, 'Send failed',
                 f"Couldn't queue any comments to session '{matched_tag}'.\n\n"
+                'The session server may have stopped — check it and try again.'
+            )
+
+    def _on_send_threads_partial_failure(
+        self, sent_count: int, failed_count: int, matched_tag: str,
+    ) -> None:
+        """Handle partial-send completion (replaces the success popup).
+
+        Fires INSTEAD of ``finished`` when any per-cmd send returned
+        False.  Worker cleanup needs to happen here too because
+        ``_on_send_threads_finished`` won't run on this path.  Failed
+        comments are NOT acked, so the next click re-detects them.
+        """
+        if self._send_threads_worker:
+            self._send_threads_worker.deleteLater()
+            self._send_threads_worker = None
+        self._set_busy(False)
+        QApplication.restoreOverrideCursor()
+
+        if sent_count > 0:
+            sent_noun = 'comment' if sent_count == 1 else 'comments'
+            failed_noun = 'comment' if failed_count == 1 else 'comments'
+            QMessageBox.warning(
+                self, 'Partial delivery',
+                f"Sent {sent_count} {sent_noun} to '{matched_tag}', but "
+                f"{failed_count} {failed_noun} failed to deliver.\n\n"
+                "The failed comments were NOT acknowledged on the SCM side, "
+                "so they'll be re-detected next time you click "
+                "'Send comments to session' (or on the next auto-fetch).\n\n"
+                'Common causes: session was killed mid-loop, queue is full, '
+                'or socket dropped.'
+            )
+            self._start_scm_poll()
+        else:
+            # All sends failed — single explicit popup.
+            QMessageBox.warning(
+                self, 'Send failed',
+                f"Couldn't deliver any of the {failed_count} comment(s) to "
+                f"session '{matched_tag}'.\n\n"
                 'The session server may have stopped — check it and try again.'
             )
 
@@ -620,6 +663,46 @@ class PRTrackingMixin(_Base):
             'Common cause: the SCM token lacks the "api" scope '
             '(GitLab) or sufficient permissions (GitHub).\n'
             "Update your token, then re-enable \"Auto '/leap' fetch\"."
+        )
+
+    def _on_leap_send_recovered(self, tag: str) -> None:
+        """Successful auto-fetch send for *tag* — clear any stale
+        "we already warned about this tag" entry so the NEXT failure
+        (if the session crashes again) gets a fresh popup instead of
+        a status-bar-only message.
+        """
+        warned = getattr(self, '_leap_send_failed_warned', None)
+        if warned is not None:
+            warned.discard(tag)
+
+    def _on_leap_send_failed(self, tag: str) -> None:
+        """Handle failure to deliver an auto-fetched /leap to a Leap session.
+
+        We deliberately don't ack the comment in this case (so the next
+        poll retries the delivery) — without surfacing it the user would
+        have no idea the message never landed.  De-duplicates per-tag so
+        a single broken session doesn't spam popups every poll.
+        """
+        already_warned = getattr(self, '_leap_send_failed_warned', set())
+        if tag in already_warned:
+            self._show_status(
+                f"/leap delivery to '{tag}' still failing — will keep retrying"
+            )
+            return
+        already_warned.add(tag)
+        self._leap_send_failed_warned = already_warned
+
+        QMessageBox.warning(
+            self, '/leap Delivery Failed',
+            f"Failed to deliver an auto-fetched /leap message to session "
+            f"'{tag}'.\n\n"
+            "The PR comment has NOT been acknowledged, so the next poll "
+            "cycle will retry delivery.\n\n"
+            "Common causes:\n"
+            "  • Session is not running (no socket)\n"
+            "  • Session's queue is full or unhealthy\n\n"
+            "If the session has been closed permanently, dismiss this row "
+            "from the monitor or remove the /leap comment to stop retries."
         )
 
         self._show_status("/leap auto-fetch disabled (acknowledgment failed)")

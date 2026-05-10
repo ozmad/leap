@@ -151,14 +151,35 @@ class NotificationsMixin(_Base):
         # server) and fill remaining slots with historical IDs.  This
         # prevents active notifications from being evicted and then
         # re-firing as "new" after a restart.
+        #
+        # Sort historical IDs deterministically before trimming so eviction
+        # is reproducible across runs (Python set iteration order is
+        # insertion-stable but its serialised form isn't).  Numeric IDs
+        # sort by parsed int value so newer IDs (typically higher) are
+        # kept; non-numeric IDs fall back to lexicographic.
         _MAX_SEEN = 5000
+
+        def _sort_key(value: str) -> tuple[int, str]:
+            try:
+                return (0, f'{int(value):020d}')
+            except ValueError:
+                return (1, value)
+
         for scm_type in list(self._notification_seen):
             seen = self._notification_seen[scm_type]
             if len(seen) > _MAX_SEEN:
                 current = {n.id for n in notifications if n.scm_type == scm_type}
                 historical = seen - current
                 max_historical = max(0, _MAX_SEEN - len(current))
-                trimmed = set(list(historical)[:max_historical])
+                # Keep the most recent (largest-valued) historical IDs.
+                # Guard against ``[-0:]`` returning the whole list when
+                # ``current`` alone already fills the cap.
+                if max_historical:
+                    trimmed = set(
+                        sorted(historical, key=_sort_key)[-max_historical:]
+                    )
+                else:
+                    trimmed = set()
                 self._notification_seen[scm_type] = current | trimmed
 
         # Persist seen IDs

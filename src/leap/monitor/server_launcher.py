@@ -18,7 +18,7 @@ from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QMessageBox
 
 from leap.monitor.pr_tracking.config import save_pinned_sessions
-from leap.monitor.pr_tracking.git_utils import detect_default_branch
+from leap.monitor.pr_tracking.git_utils import detect_default_branch, resolve_ssh_alias
 from leap.monitor.navigation import open_terminal_with_command
 from leap.monitor.scm_polling import BackgroundCallWorker
 from leap.monitor.dialogs.settings_dialog import DEFAULT_REPOS_DIR
@@ -63,7 +63,15 @@ class ServerLauncher:
         return None
 
     def _build_clone_url(self, host_url: str, remote_project: str, scm_type: str) -> str:
-        """Build clone URL, injecting SCM token for authentication if available."""
+        """Build clone URL, injecting SCM token for authentication if available.
+
+        Resolves SSH aliases at the host fragment (e.g. ``planck_gitlab`` →
+        ``gitlab.com`` via ``~/.ssh/config``) — historically Leap stored
+        ``host_url=https://<alias>`` for repos cloned via SSH alias, which
+        is unusable for HTTPS clone.  The resolution heals such entries
+        transparently; older pinned-session JSON gets corrected on the
+        next ``save_pinned_sessions`` write.
+        """
         # Strip any existing credentials from host_url (may be leftover from
         # a previous run that contaminated pinned session data).
         scheme_end = host_url.index('://') + 3 if '://' in host_url else 0
@@ -72,6 +80,9 @@ class ServerLauncher:
         # Remove user:pass@ prefix if present
         if '@' in rest:
             rest = rest.rsplit('@', 1)[-1]
+        # Resolve SSH alias (no-op for proper DNS hostnames thanks to the
+        # short-circuit in resolve_ssh_alias).
+        rest = resolve_ssh_alias(rest)
         clean_host_url = f"{scheme}{rest}"
 
         base_url = f"{clean_host_url}/{remote_project}.git"
@@ -84,6 +95,37 @@ class ServerLauncher:
         # GitLab uses oauth2 as the username
         return f"{scheme}oauth2:{encoded_token}@{rest}/{remote_project}.git"
 
+    def _heal_pinned_host_url(self, tag: str, pinned: dict[str, Any]) -> None:
+        """Migrate a pinned-session entry whose host_url is an SSH alias.
+
+        Called best-effort from the server-start path: if the stored
+        ``host_url`` looks alias-shaped (no dots after the scheme) and
+        ``ssh -G`` resolves it to something different, rewrite the
+        pinned-sessions entry so future polls / clones / save-pinned
+        rounds produce a usable URL.  No-op for proper DNS hostnames.
+        """
+        host_url = pinned.get('host_url', '')
+        if not host_url or '://' not in host_url:
+            return
+        scheme, _, rest = host_url.partition('://')
+        # Only consider alias-shaped hosts (no dots) — proper DNS names
+        # already work, and resolve_ssh_alias would just echo them back.
+        host_only = rest.split('/', 1)[0]
+        if '.' in host_only or host_only == 'localhost':
+            return
+        resolved = resolve_ssh_alias(host_only)
+        if resolved == host_only:
+            return  # ssh -G didn't translate; nothing to migrate
+        new_host_url = f'{scheme}://{resolved}'
+        pinned['host_url'] = new_host_url
+        try:
+            save_pinned_sessions(self._w._pinned_sessions)
+            logger.debug("Migrated host_url alias for tag %s: %s -> %s",
+                         tag, host_only, resolved)
+        except Exception:
+            logger.debug("Failed to persist host_url migration for %s",
+                         tag, exc_info=True)
+
     def start_server(self, tag: str) -> None:
         """Start a new server for a pinned (dead) row.
 
@@ -92,6 +134,9 @@ class ServerLauncher:
         For auto-pinned rows (with local project_path): open Leap directly.
         """
         pinned = self._w._pinned_sessions.get(tag, {})
+        # Best-effort: heal a host_url that looks like an SSH alias before
+        # we try to use it.  No-op for proper DNS hostnames.
+        self._heal_pinned_host_url(tag, pinned)
 
         if pinned.get('remote_project_path'):
             project_path = pinned.get('project_path')
