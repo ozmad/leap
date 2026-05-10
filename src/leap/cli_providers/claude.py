@@ -484,22 +484,36 @@ class ClaudeProvider(CLIProvider):
         Handles special cases:
         - 'Type something' options: return error asking for text input
         - 'Chat about this' options: use arrow-key navigation
-        - Regular options: type digit(s) char-by-char + CR
+        - Regular options: atomic single write of digit(s) + CR
 
-        **Why char-by-char + immediate CR (instead of ``pty_sendline``):**
-        ``pty_sendline`` writes the digit, then runs an output-settle
-        wait (50–200 ms) before writing CR.  For Claude's permission
-        menu that wider gap can let the menu auto-confirm on the digit
-        and dismiss BEFORE the CR arrives — the CR then lands in the
-        now-active composer and submits whatever text the user had
-        typed-but-not-submitted.  Manual digit + Enter from the
-        keyboard doesn't leak (the bytes arrive ~10–30 ms apart, fast
-        enough for the menu's input handler to read both before
-        dismissal renders).  We mimic that by sending the digit(s)
-        char-by-char with 20 ms gaps and the CR immediately after the
-        last digit, with no settle wait.  Multi-digit options
-        (``option_num >= 10``) are handled correctly because each
-        digit lands while the menu is still the focused component.
+        **Why an atomic single write (instead of ``pty_sendline``):**
+        ``pty_sendline`` writes the digit, runs an output-settle
+        wait (50–200 ms), then writes CR.  That gap is wide enough
+        that a leaky permission menu — one that auto-confirms on
+        the digit and dismisses immediately — releases focus to the
+        composer BEFORE the CR arrives, and the CR then lands in
+        the composer and submits whatever text the user had typed-
+        but-not-submitted.
+
+        Even a small gap (e.g. ``pty.send(digit); time.sleep(0.02);
+        pty.send('\\r')``) is unsafe: each call is a separate
+        ``write()``, so the CLI's input-handling loop typically
+        processes the digit in one ``read()`` and the CR in the
+        next — same outcome.
+
+        Sending digit + CR as a single ``write()`` call places both
+        bytes in the kernel's PTY buffer atomically; the CLI's next
+        ``read(N)`` returns both bytes in the same chunk.  A well-
+        behaved menu drains the trailing CR from the post-confirm
+        chunk and discards it, so nothing leaks to the composer.
+
+        Multi-digit options (``option_num >= 10``) are written the
+        same way (e.g. ``"10\\r"``).  If a future Claude menu
+        auto-confirms on the very first digit, the trailing bytes
+        of a multi-digit number would be drained alongside the CR
+        and the user-selected option might be wrong — but that's a
+        provider-design question; for typical 1–9 option menus the
+        single-write form is correct.
         """
         label = options.get(option_num)
         if label is not None:
@@ -522,11 +536,7 @@ class ClaudeProvider(CLIProvider):
                 'status': 'error',
                 'error': f'option {option_num} not found in prompt',
             }
-        digit_str = str(option_num)
-        for ch in digit_str:
-            pty_send(ch)
-            time.sleep(0.02)
-        pty_send('\r')
+        pty_send(str(option_num) + '\r')
         return {'status': 'sent'}
 
     def send_custom_answer(
