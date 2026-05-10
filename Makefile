@@ -8,6 +8,17 @@ SCRIPTS_DIR      := $(SRC_DIR)/scripts
 # Ensure ~/.local/bin is in PATH for all recipes (Poetry installer puts poetry there)
 export PATH := $(HOME)/.local/bin:$(PATH)
 
+# Strip env vars that can poison every recipe's Python before it even
+# starts.  PYTHONHOME from a stale/abandoned venv triggers
+# ``Fatal Python error: Failed to import encodings module`` — it makes
+# Python look for the stdlib in the wrong place.  VIRTUAL_ENV would
+# make poetry try to use whatever venv the user happens to have active,
+# instead of Leap's.  These don't affect the user's interactive shell —
+# only commands launched from this Makefile.
+unexport PYTHONHOME
+unexport PYTHONPATH
+unexport VIRTUAL_ENV
+
 # Colors for output
 GREEN  := \033[0;32m
 YELLOW := \033[1;33m

@@ -34,6 +34,15 @@
 STATE="$1"
 [ -z "$STATE" ] && echo '{}' && exit 0
 
+# Strip env vars that can poison Python before it starts.  Hooks are
+# invoked from the CLI agent's subprocess, which inherited *its* env
+# from the user's shell — so PYTHONHOME / PYTHONPATH / VIRTUAL_ENV
+# from a stale venv can leak in here even when the Leap server itself
+# was launched with a clean env.  Without this unset a poisoned shell
+# state would cause every hook fire to crash with "Failed to import
+# encodings", which silently breaks state tracking and resume.
+unset PYTHONHOME PYTHONPATH VIRTUAL_ENV
+
 # Use venv Python if available (set by Leap server), fall back to PATH python3.
 # Homebrew-only installs may not have python3 in PATH inside CLI subshells.
 PYTHON="${LEAP_PYTHON:-python3}"

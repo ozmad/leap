@@ -7,6 +7,14 @@
 # Makefile.  This means changes to the update flow itself take effect
 # on the same `leap --update` run, not the next one.
 #
+
+# Strip env vars that can poison Python before it starts.  PYTHONHOME
+# from a stale/abandoned venv triggers ``Failed to import encodings``
+# in poetry/python sub-calls; VIRTUAL_ENV would make poetry use the
+# wrong project's venv.  Only affects this script's children (including
+# the make recipes it execs into), not the user's shell.
+unset PYTHONHOME PYTHONPATH VIRTUAL_ENV
+
 set -e
 
 GREEN='\033[0;32m'

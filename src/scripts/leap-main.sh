@@ -5,6 +5,12 @@
 # Uses Poetry venv Python
 #
 
+# Strip env vars that can poison Python before it starts.  PYTHONHOME
+# from a stale/abandoned venv triggers ``Failed to import encodings``;
+# VIRTUAL_ENV would make sub-tools think a different project's venv is
+# active.  Only affects this script's children, not the user's shell.
+unset PYTHONHOME PYTHONPATH VIRTUAL_ENV
+
 # Find and enforce virtualenv Python usage (NEVER use system python3)
 # Primary source: .storage/venv-path file (written by make install)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,7 +94,7 @@ fi
 
 # Manage CLI order if requested
 if [ "$1" = "--manage-clis" ]; then
-    PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}" \
+    PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
         "$PYTHON_CMD" "$PROJECT_DIR/src/scripts/leap-manage-clis.py"
     exit $?
 fi
@@ -102,7 +108,7 @@ if [ "$1" = "--resume" ]; then
     # Any remaining args (e.g. --cli=X --tag=Y --session=Z from a GUI
     # pre-pick hand-off) are forwarded to leap-resume.py.  Bare
     # ``leap --resume`` keeps its interactive picker.
-    PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}" \
+    PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
         exec "$PYTHON_CMD" "$PROJECT_DIR/src/scripts/leap-resume.py" "$@"
 fi
 
@@ -132,7 +138,7 @@ if [ "$1" = "--slack" ]; then
     echo "${LEAP_SLACK_SOURCE:-terminal}" > "$SLACK_LOCK_DIR/source"
     # No exec — keep the shell alive so the trap can clean up the lock dir
     trap 'rm -f "$SLACK_LOCK_DIR/source"; rmdir "$SLACK_LOCK_DIR" 2>/dev/null' EXIT INT TERM
-    PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}" \
+    PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
         "$PYTHON_CMD" "$PROJECT_DIR/src/scripts/leap-slack.py" "$@"
     exit $?
 fi
@@ -324,8 +330,11 @@ fi
 # Get script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Add src directory to PYTHONPATH so leap package can be found
-export PYTHONPATH="${SCRIPT_DIR}/..:${PYTHONPATH}"
+# Add src directory to PYTHONPATH so leap package can be found.
+# Use the ``${var:+:$var}`` form so an unset/empty PYTHONPATH doesn't
+# leave a trailing colon — that would silently inject the cwd into
+# sys.path (a footgun for module-shadowing / import-hijacking).
+export PYTHONPATH="${SCRIPT_DIR}/..${PYTHONPATH:+:$PYTHONPATH}"
 
 # Storage paths (centralized in .storage folder at project root)
 STORAGE_DIR="$PROJECT_DIR/.storage"
@@ -414,7 +423,7 @@ cleanup_dead_sockets() {
         # Pass STORAGE_DIR as sys.argv[1] rather than string-interpolating it
         # into the -c body — otherwise a path with a single quote in it would
         # break Python's own quoting.
-        PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}" \
+        PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
             "$PYTHON_CMD" -c "import sys; from pathlib import Path; from leap.utils.resume_store import prune_stale; prune_stale(Path(sys.argv[1]))" "$STORAGE_DIR" 2>/dev/null
     fi
 }

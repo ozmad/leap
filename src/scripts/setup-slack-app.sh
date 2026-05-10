@@ -6,6 +6,11 @@
 # Creates a Slack app via App Manifest, collects tokens, validates
 # them, and saves configuration to .storage/slack/config.json.
 
+# Strip poisonous Python env vars so PYTHONHOME from a stale venv
+# can't crash this script's python3 calls.  Same defensive stripping
+# the rest of the Leap entry-point scripts do.
+unset PYTHONHOME PYTHONPATH VIRTUAL_ENV
+
 set -euo pipefail
 
 REPO_PATH="${1:-.}"

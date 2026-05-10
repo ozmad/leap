@@ -3,6 +3,13 @@
 # Leap CLI selector - interactive menu to choose CLI provider
 # Called by the 'leap' shell function
 #
+
+# Strip env vars that can poison Python before it starts.  PYTHONHOME
+# from a stale/abandoned venv triggers ``Failed to import encodings``;
+# VIRTUAL_ENV would make sub-tools think a different project's venv is
+# active.  Only affects this script's children, not the user's shell.
+unset PYTHONHOME PYTHONPATH VIRTUAL_ENV
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 STORAGE_DIR="$PROJECT_DIR/.storage"
