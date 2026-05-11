@@ -364,10 +364,18 @@ class ActionsMenuMixin(_Base):
              so it doesn't pop another confirmation), chained with
              ``on_done`` so we run the IDE launch only after shutdown
              completes.
-          3. From the on_done callback: open the .app on
-             ``project_path`` and open a terminal inside it that runs
-             the resume command (or a fresh ``leap <tag>`` if there's
-             no transcript).
+          3. From the on_done callback: ``open -a`` the bundle the
+             user picked (reliable LaunchServices open — important
+             for JetBrains Toolbox installs whose CLI shims use
+             ``open -na`` and don't reliably activate), then call
+             ``open_terminal_with_command`` with
+             ``project_already_open=True`` so ``_open_jetbrains_terminal``
+             skips its own ``[ide_cmd, project_path]`` open call.
+             This gives us exactly *one* open request in flight, which
+             prevents both the duplicate-window bug (two competing
+             opens) and the Toolbox-CLI-doesn't-activate bug (no
+             usable open at all).  The poll loop then waits for the
+             IDE's scripting engine and creates the terminal tab.
 
         ``preferred_ide`` is the canonical key
         ``open_terminal_with_command`` routes on (e.g. ``'PyCharm'``,
@@ -402,10 +410,26 @@ class ActionsMenuMixin(_Base):
         _app, _proj = app_path, project_path
         _tag, _cli, _sid = tag, cli, session_id
         _preferred_ide = preferred_ide
+        _fallback_terminal = self._prefs.get('default_terminal', '') or None
 
         def _after_close() -> None:
-            # 1) Open the .app on the project so the IDE picks up the
-            # right window for the AppleScript that follows.
+            # 1) Open the .app on the project via LaunchServices.  This
+            # uses the *exact* ``.app`` path the user picked, which is
+            # critical for JetBrains Toolbox installs: their generated
+            # CLI shims (`~/.../Toolbox/scripts/<ide>`) use ``open -na``
+            # internally — that forces a *new* instance and the
+            # subsequent activation is unreliable; on some setups
+            # nothing visible happens at all.  ``open -a <full path>``
+            # on the bundle bypasses that and reliably focuses the
+            # right window.
+            #
+            # The duplicate-window bug that originally motivated
+            # removing this line is now prevented by passing
+            # ``project_already_open=True`` to
+            # ``open_terminal_with_command`` below, which makes
+            # ``_open_jetbrains_terminal`` skip its own
+            # ``[ide_cmd, project_path]`` call — so we have exactly
+            # one open request in flight, not two competing ones.
             try:
                 subprocess.Popen(
                     ['open', '-a', _app, _proj],
@@ -435,17 +459,84 @@ class ActionsMenuMixin(_Base):
             parts.append(leap_cmd)
             cmd = " && ".join(parts)
 
-            launch_worker = BackgroundCallWorker(
-                lambda: open_terminal_with_command(
-                    cmd, preferred_ide=_preferred_ide, project_path=_proj,
-                ),
-                self,
-            )
-            launch_worker.finished.connect(launch_worker.deleteLater)
-            launch_worker.start()
             label = _app.rsplit('/', 1)[-1].removesuffix('.app')
             verb = 'Resuming' if _sid else 'Starting'
             self._show_status(f"{verb} '{_tag}' in {label}")
+
+            # Track which app the helper actually opened in, so we can
+            # show an accurate completion message instead of leaving
+            # "Resuming '<tag>' in PyCharm" stuck on screen for minutes
+            # — possibly lying outright if the helper falls back.
+            result_holder: dict = {'ok': False, 'used': None}
+
+            # The poll loop in ``_open_jetbrains_terminal`` calls this
+            # every iteration; once the tag leaves ``_moving_tags`` (X
+            # button, drag-remove, or the 12-min safety net) we want
+            # the worker to bail instead of spinning for another 10
+            # minutes against an IDE the user has visibly given up on.
+            def _should_cancel() -> bool:
+                return _tag not in self._moving_tags
+
+            def _do_open() -> None:
+                outcome: dict = {}
+                ok = bool(open_terminal_with_command(
+                    cmd, preferred_ide=_preferred_ide, project_path=_proj,
+                    fallback_terminal=_fallback_terminal,
+                    outcome=outcome,
+                    should_cancel=_should_cancel,
+                    project_already_open=True,
+                ))
+                result_holder['ok'] = ok
+                result_holder['used'] = outcome.get('used')
+
+            launch_worker = BackgroundCallWorker(_do_open, self)
+
+            # JetBrains cold-start can run minutes — emit a periodic
+            # "still waiting" tick so the status bar doesn't look frozen
+            # behind the initial "Resuming…" line.  ``done_flag`` (a
+            # mutable single-element list, *not* ``launch_worker``) is
+            # what the tick checks: a ``timeout`` event already queued
+            # when ``progress_timer.stop()`` runs in ``_on_done`` will
+            # still fire, and (a) we don't want it to overwrite the
+            # final status with a stale "Waiting…", and (b) probing
+            # ``launch_worker`` after its ``deleteLater`` has resolved
+            # would raise a "wrapped C++ object deleted" RuntimeError.
+            progress_timer = QTimer(self)
+            progress_timer.setInterval(30_000)
+            done_flag = [False]
+
+            def _progress_tick() -> None:
+                if not done_flag[0]:
+                    self._show_status(
+                        f"Waiting for {label} to be ready for "
+                        f"'{_tag}'…"
+                    )
+
+            progress_timer.timeout.connect(_progress_tick)
+            progress_timer.start()
+
+            def _on_done() -> None:
+                done_flag[0] = True
+                progress_timer.stop()
+                progress_timer.deleteLater()
+                used = result_holder['used']
+                if not result_holder['ok']:
+                    self._show_status(
+                        f"Could not open '{_tag}' in {label}"
+                    )
+                elif used == _preferred_ide:
+                    self._show_status(
+                        f"'{_tag}' opened in {label}"
+                    )
+                else:
+                    self._show_status(
+                        f"'{_tag}' opened in {used} "
+                        f"({label} unavailable)"
+                    )
+
+            launch_worker.finished.connect(_on_done)
+            launch_worker.finished.connect(launch_worker.deleteLater)
+            launch_worker.start()
 
         # Bridge the dead-row gap: between ``_close_server`` finishing
         # and the IDE-launched ``leap <tag>`` registering a new active
@@ -459,17 +550,24 @@ class ActionsMenuMixin(_Base):
         # server is currently alive — and at this exact moment the old
         # server *is* still alive, so a 1 s auto-refresh tick during
         # the close would clear it before close completes.  The
-        # ``_moving_tags`` set has no auto-clear; we explicitly drop the
-        # tag after a 60 s safety-net timeout.  When the new server
+        # ``_moving_tags`` set has no auto-clear; we explicitly drop
+        # the tag after a safety-net timeout.  When the new server
         # registers as active, ``_merge_sessions`` merges normally;
-        # ``_moving_tags`` becomes a no-op for that tag (it only matters
-        # in the dead-row branch).  60 s is comfortable for slow JetBrains
-        # cold starts; if the IDE fails to launch, the row falls into
-        # the normal dead-row removal path after the timeout — same
-        # end state as today.
+        # ``_moving_tags`` becomes a no-op for that tag (it only
+        # matters in the dead-row branch).
+        #
+        # The timeout must comfortably exceed
+        # ``_open_jetbrains_terminal``'s poll budget (10 min) plus
+        # the post-poll handoff to ``leap <tag>`` and the new server
+        # registering.  Earlier 60 s value was tuned for a 10 s
+        # ideScript timeout; raising the poll budget without raising
+        # this would let a slow cold-start tick past the safety net
+        # and silently wipe the row's pin (alias, colour,
+        # ``row_order``) before the new server registers — at which
+        # point the new server re-pins as a fresh row at the bottom.
         self._moving_tags.add(_tag)
         QTimer.singleShot(
-            60_000, lambda: self._moving_tags.discard(_tag),
+            720_000, lambda: self._moving_tags.discard(_tag),  # 12 min
         )
         # Close the server (same path as the X button), then run our
         # follow-up.  ``_from_delete=True`` skips _close_server's own

@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import AppKit
 from ApplicationServices import (
@@ -108,19 +108,56 @@ def detect_supported_ide_for_move(app_path: str) -> Optional[str]:
 def _jetbrains_env() -> dict[str, str]:
     """Build an env dict with JetBrains CLI tools on PATH.
 
-    Searches /Applications, ~/Applications (JetBrains Toolbox), and
-    the Toolbox shell scripts directory.
+    Covers four common install layouts:
+
+    * Standalone installs at ``/Applications/<App>.app`` or
+      ``~/Applications/<App>.app`` (downloaded ``.dmg``).
+    * Toolbox installs at ``~/Applications/JetBrains Toolbox/<App>.app``
+      (one subdirectory level under ``~/Applications`` — the Toolbox
+      default since the 2.x rewrite when "Generate shell scripts" is
+      off but the user has ticked the "Update apps" sync into
+      ~/Applications).
+    * Toolbox's actual install root,
+      ``~/Library/Application Support/JetBrains/Toolbox/apps/**/<App>.app``
+      — the canonical Toolbox 2.x location.  Searched recursively
+      because the path includes a version directory
+      (``apps/GoLand/ch-0/<version>/GoLand.app``).
+    * ``~/Library/Application Support/JetBrains/Toolbox/scripts``
+      shell-script directory, populated when the user enables
+      "Generate shell scripts" in Toolbox settings.
+
+    Without the Toolbox-aware lookups, a Toolbox-only user (no
+    ``.app`` in ``/Applications``) ends up with no JetBrains CLI on
+    PATH — every ``goland``/``pycharm``/etc. subprocess raises
+    ``FileNotFoundError`` and the move-to-IDE flow silently falls
+    back to Terminal.app.
     """
     env = os.environ.copy()
     jetbrains_paths: list[str] = []
 
-    # Search .app bundles in known directories
+    # Standalone installs + one subdirectory level (for
+    # ~/Applications/JetBrains Toolbox/<App>.app)
     for app_dir in _JETBRAINS_APP_DIRS:
         for pattern in _JETBRAINS_APP_PATTERNS:
             for app in glob.glob(f'{app_dir}/{pattern}'):
                 jetbrains_paths.append(f'{app}/Contents/MacOS')
+            for app in glob.glob(f'{app_dir}/*/{pattern}'):
+                jetbrains_paths.append(f'{app}/Contents/MacOS')
 
-    # JetBrains Toolbox shell scripts directory
+    # Toolbox-managed install root.  Tree is shallow (4-5 levels) so
+    # the recursive glob is cheap.
+    toolbox_apps_root = os.path.expanduser(
+        '~/Library/Application Support/JetBrains/Toolbox/apps'
+    )
+    if os.path.isdir(toolbox_apps_root):
+        for pattern in _JETBRAINS_APP_PATTERNS:
+            for app in glob.glob(
+                f'{toolbox_apps_root}/**/{pattern}', recursive=True,
+            ):
+                jetbrains_paths.append(f'{app}/Contents/MacOS')
+
+    # Toolbox shell-script directory (optional; only present if the
+    # user enabled the option in Toolbox settings).
     toolbox_scripts = os.path.expanduser(
         '~/Library/Application Support/JetBrains/Toolbox/scripts'
     )
@@ -168,17 +205,38 @@ def open_terminal_with_command(
     command: str,
     preferred_ide: Optional[str] = None,
     project_path: Optional[str] = None,
+    fallback_terminal: Optional[str] = None,
+    outcome: Optional[dict] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    project_already_open: bool = False,
 ) -> bool:
     """
     Open a new terminal tab and run a command in it.
 
     Opens exclusively in the preferred IDE/terminal when known.
-    Falls back to Terminal.app then iTerm2 only when preferred_ide is unknown.
+    On failure, tries ``fallback_terminal`` next (if given), then
+    Terminal.app, then iTerm2 as a last resort.
 
     Args:
         command: Command to execute in the new terminal.
         preferred_ide: IDE or terminal app to open in (from session metadata).
         project_path: Project path for IDE navigation.
+        fallback_terminal: User's configured default terminal
+            (``'iTerm2'`` / ``'Terminal.app'`` / ``'Warp'`` / ``'WezTerm'``)
+            to try if the primary path fails.  Spares an iTerm2 user
+            from being dropped into Terminal.app when an IDE move
+            fails.
+        outcome: Optional mutable dict.  When provided, the function
+            sets ``outcome['used']`` to the canonical name of whichever
+            helper actually opened the terminal — lets the caller
+            distinguish "preferred IDE worked" from "fell back to
+            iTerm2" for accurate post-completion status messages.
+        should_cancel: Optional callable.  Currently consulted only by
+            the JetBrains cold-start poll loop, which checks it each
+            iteration; if it returns True, the poll bails to the
+            fallback chain.  Used to plumb in row-removal signals so
+            a user clicking the X mid-move doesn't leave a 10-min
+            worker spinning against a dead IDE.
 
     Returns:
         True if a new terminal was opened successfully.
@@ -189,38 +247,67 @@ def open_terminal_with_command(
         logger.warning("project_path does not exist, ignoring: %s", project_path)
         project_path = None
 
+    def _record(name: str) -> bool:
+        """Helper: stamp ``outcome['used']`` and return True."""
+        if outcome is not None:
+            outcome['used'] = name
+        return True
+
     if preferred_ide:
         # Try the specific IDE first. If it fails, fall through to generic
         # fallback so that a terminal always opens somewhere.
         if any(ide in preferred_ide for ide in _JETBRAINS_IDE_NAMES):
-            if _open_jetbrains_terminal(preferred_ide, project_path, command):
-                return True
+            if _open_jetbrains_terminal(
+                preferred_ide, project_path, command,
+                should_cancel=should_cancel,
+                project_already_open=project_already_open,
+            ):
+                return _record(preferred_ide)
         elif preferred_ide in ('VS Code', 'Cursor'):
             if _open_vscode_terminal(project_path, command, ide=preferred_ide):
-                return True
+                return _record(preferred_ide)
         elif preferred_ide == 'iTerm2':
             if _open_iterm2_terminal(command):
-                return True
+                return _record('iTerm2')
             logger.debug("iTerm2 open failed, falling back")
         elif preferred_ide == 'Terminal.app':
             if _open_terminal_app_terminal(command):
-                return True
+                return _record('Terminal.app')
             logger.debug("Terminal.app open failed, falling back")
         elif preferred_ide == 'Warp':
             if _open_warp_terminal(command):
-                return True
+                return _record('Warp')
             logger.debug("Warp open failed, falling back")
         elif preferred_ide == 'WezTerm':
             if _open_wezterm_terminal(command):
-                return True
+                return _record('WezTerm')
             logger.debug("WezTerm open failed, falling back")
 
-    # Preferred IDE failed or unknown — fall back to Terminal.app then iTerm2.
-    # Warp/WezTerm intentionally excluded: opening a *new* terminal in an app
-    # the user doesn't use is more disruptive than navigating/closing.
+    # Preferred path failed or unknown.  Try the caller's configured
+    # default terminal first (so an iTerm2 user isn't surprised with
+    # Terminal.app when their IDE move falls back), then last-resort
+    # through Terminal.app / iTerm2.  Warp/WezTerm aren't in the
+    # last-resort chain: opening a *new* terminal in an app the user
+    # doesn't use is more disruptive than dropping into the default.
+    if fallback_terminal and fallback_terminal != preferred_ide:
+        if fallback_terminal == 'iTerm2':
+            if _open_iterm2_terminal(command):
+                return _record('iTerm2')
+        elif fallback_terminal == 'Terminal.app':
+            if _open_terminal_app_terminal(command):
+                return _record('Terminal.app')
+        elif fallback_terminal == 'Warp':
+            if _open_warp_terminal(command):
+                return _record('Warp')
+        elif fallback_terminal == 'WezTerm':
+            if _open_wezterm_terminal(command):
+                return _record('WezTerm')
+
     if _open_terminal_app_terminal(command):
-        return True
-    return _open_iterm2_terminal(command)
+        return _record('Terminal.app')
+    if _open_iterm2_terminal(command):
+        return _record('iTerm2')
+    return False
 
 
 def close_terminal_with_title(
@@ -1382,81 +1469,243 @@ def _schedule_warp_config_cleanup(path: Path) -> None:
     t.start()
 
 
+def _is_jetbrains_running(ide: str) -> bool:
+    """Return True if a JetBrains app matching *ide* is currently running.
+
+    Used by ``_open_jetbrains_terminal``'s poll loop as a liveness check:
+    if the IDE was once running and is no longer (e.g. the user closed
+    it, or it crashed during cold-start), keep polling against nothing
+    is pointless — bail to the fallback chain.
+
+    Matches via lower-cased substring against ``localizedName`` and
+    ``bundleIdentifier``; ``'IntelliJ IDEA'`` is normalised to
+    ``'intellij'`` so it matches ``com.jetbrains.intellij`` for any
+    edition.  On any NSWorkspace error returns True so a transient
+    Cocoa failure doesn't spuriously bail the move.
+    """
+    needle = ide.lower().replace(' idea', '').strip()
+    try:
+        for app in AppKit.NSWorkspace.sharedWorkspace().runningApplications():
+            name = (app.localizedName() or '').lower()
+            bundle = (app.bundleIdentifier() or '').lower()
+            if needle and (needle in name or needle in bundle):
+                return True
+    except Exception:
+        logger.debug("_is_jetbrains_running error", exc_info=True)
+        return True
+    return False
+
+
 def _open_jetbrains_terminal(
     ide: str,
     project_path: Optional[str],
-    command: str
+    command: str,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    project_already_open: bool = False,
 ) -> bool:
-    """Open a new terminal tab in JetBrains IDE and run a command."""
+    """Open a new terminal tab in JetBrains IDE and run a command.
+
+    Polls the IDE's scripting engine for up to 10 minutes.  Cold-start
+    of PyCharm/IDEA can take 30 s+ on slower machines or first launch
+    (indexes, plugins); on a fresh install with a large project we've
+    seen multi-minute waits.  A single short attempt would force a
+    Terminal.app fallback every time the IDE wasn't already running —
+    we'd rather make the user wait than surprise them.
+
+    The poll bails early if:
+      * ``should_cancel`` is provided and returns True (e.g. the user
+        removed the row via the X button), or
+      * the IDE process was seen running and then disappeared (the
+        user closed the IDE, or it crashed mid-startup), or
+      * the IDE never appeared at all within the appearance grace
+        period (90 s).
+
+    If ``project_already_open`` is True the function skips the
+    ``[ide_cmd, project_path]`` open call — the caller is responsible
+    for having already invoked ``open -a`` on the bundle (e.g. the
+    Move-to-IDE flow does this for reliability: the JetBrains
+    Toolbox-generated CLI shims use ``open -na`` which forces a
+    second instance and the activation is unreliable; ``open -a`` on
+    the exact ``.app`` path the user picked bypasses that and is
+    guaranteed to focus the right window).
+    """
     ide_cmd = _IDE_CMD_MAP.get(ide)
     if not ide_cmd:
         return False
 
+    # Result file the Groovy script writes to.  We use this — *not*
+    # ideScript's exit code — to detect success, because:
+    #   * ``ideScript`` swallows uncaught exceptions and returns 0
+    #     anyway, so a top-level throw can't signal failure.
+    #   * ``System.exit(N)`` would propagate, but ``ideScript`` runs
+    #     inside the *running* IDE (forwarded via IPC), so calling
+    #     ``System.exit`` would kill the user's actual IDE.  Hard no.
+    # The Groovy writes one of three sentinels synchronously before
+    # returning to ``ideScript``:
+    #   * ``QUEUED``  — target project found, terminal-creation work
+    #                   queued onto EDT.  Treat as success.
+    #   * ``WAITING`` — project_path was provided but isn't yet in
+    #                   ``ProjectManager.getOpenProjects()`` (cold-
+    #                   start hasn't finished loading it).  Retry.
+    #   * absent      — script didn't run (IDE not ready / IPC
+    #                   failed).  Retry.
+    result_file = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', prefix='leap-ideresult-', delete=False,
+    )
+    result_file.close()
+    result_path = result_file.name
+
     project_match = ""
     if project_path:
+        # Synchronous loop at top level (NOT inside invokeLater) so the
+        # ``WAITING`` branch can short-circuit the script before any
+        # EDT work is queued.
         project_match = f'''
-    for (var i = 0; i < allProjects.length; i++) {{
-        var project = allProjects[i]
-        if (project.getBasePath() != null && project.getBasePath().equals("{_escape_groovy(project_path)}")) {{
-            targetProject = project
-            break
-        }}
-    }}'''
+for (var i = 0; i < allProjects.length; i++) {{
+    var project = allProjects[i]
+    if (project.getBasePath() != null && project.getBasePath().equals("{_escape_groovy(project_path)}")) {{
+        targetProject = project
+        break
+    }}
+}}'''
 
     groovy_script = f'''import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.openapi.project.ProjectManager
 import org.jetbrains.plugins.terminal.TerminalToolWindowManager
+import java.io.FileWriter
 
-IDE.application.invokeLater {{
-    var targetProject = null
-    var allProjects = ProjectManager.getInstance().getOpenProjects()
-    {project_match}
-    if (targetProject == null && allProjects.length > 0) {{
-        targetProject = allProjects[0]
-    }}
-    if (targetProject != null) {{
-        var terminalManager = TerminalToolWindowManager.getInstance(targetProject)
-        var widget = terminalManager.createLocalShellWidget(targetProject.getBasePath(), "leap")
-        // Short delay to let the shell initialize, then run the command
-        new Thread({{
-            Thread.sleep(500)
-            IDE.application.invokeLater {{
-                widget.executeCommand("{_escape_groovy(command)}")
-            }}
-        }} as Runnable).start()
-    }}
+var allProjects = ProjectManager.getInstance().getOpenProjects()
+var targetProject = null
+{project_match}
+
+// When project_path is given, only accept an exact match — never
+// fall back to ``allProjects[0]`` (which is some restored-session
+// project, not what the user asked for).  When project_path is
+// empty, any open project is acceptable.
+if (targetProject == null && allProjects.length > 0 && {('false' if project_path else 'true')}) {{
+    targetProject = allProjects[0]
 }}
+
+if (targetProject == null) {{
+    // Project not loaded yet — Python's poll loop will retry.
+    var fw = new FileWriter("{_escape_groovy(result_path)}")
+    fw.write("WAITING")
+    fw.close()
+    return
+}}
+
+var p = targetProject
+IDE.application.invokeLater {{
+    var terminalManager = TerminalToolWindowManager.getInstance(p)
+    var widget = terminalManager.createLocalShellWidget(p.getBasePath(), "leap")
+    new Thread({{
+        Thread.sleep(500)
+        IDE.application.invokeLater {{
+            widget.executeCommand("{_escape_groovy(command)}")
+        }}
+    }} as Runnable).start()
+}}
+
+// Synchronous: project found, EDT work queued.  Python treats this
+// as success even though the terminal hasn't actually been rendered
+// yet — the invokeLater above is what does that, asynchronously.
+var fw = new FileWriter("{_escape_groovy(result_path)}")
+fw.write("QUEUED")
+fw.close()
 '''
 
     try:
         env = _jetbrains_env()
 
-        if project_path:
-            subprocess.run(
-                [ide_cmd, project_path],
-                capture_output=True,
-                env=env,
-                timeout=5
-            )
-            time.sleep(0.3)
+        if project_path and not project_already_open:
+            try:
+                subprocess.run(
+                    [ide_cmd, project_path],
+                    capture_output=True,
+                    env=env,
+                    timeout=5
+                )
+            except subprocess.TimeoutExpired:
+                # CLI hung handing off to the IDE — the IDE may still
+                # be coming up.  Don't bail; the poll loop below will
+                # wait for ideScript to become responsive.  (Without
+                # this catch the outer except would swallow the
+                # TimeoutExpired and we'd never enter the poll.)
+                pass
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.groovy', delete=False) as tmp:
             tmp.write(groovy_script)
             tmp_script_path = tmp.name
 
         try:
-            result = subprocess.run(
-                [ide_cmd, 'ideScript', tmp_script_path],
-                capture_output=True,
-                timeout=10,
-                env=env
-            )
-            return result.returncode == 0
+            # Poll the IDE's scripting engine until QUEUED appears in
+            # the result file or our (deliberately generous) budget is
+            # exhausted.  PyCharm cold-start with indexing/plugin load
+            # can take several minutes on a slow machine or first run.
+            #
+            # Per-iteration: clear the result file, run ``ideScript``,
+            # read the file.  ``QUEUED`` = success; anything else (or
+            # missing) = retry.  We retry on subprocess non-zero too
+            # but *not* on TimeoutExpired (could leave a duplicate
+            # ``leap`` tab queued in the IDE — see fix #A).
+            # Per-call timeout is 30 s.
+            #
+            # Three early-bail conditions besides the 10-min deadline:
+            #   * ``should_cancel`` — caller asks us to stop (X button).
+            #   * IDE seen running, then gone — closed/crashed.
+            #   * IDE never appeared within ``appearance_deadline``
+            #     (90 s) — probably picked a broken bundle.
+            deadline = time.monotonic() + 600.0  # 10 minutes
+            appearance_deadline = time.monotonic() + 90.0
+            ide_ever_seen = False
+            while True:
+                if should_cancel is not None and should_cancel():
+                    return False
+
+                running = _is_jetbrains_running(ide)
+                if running:
+                    ide_ever_seen = True
+                elif ide_ever_seen:
+                    return False  # IDE was up, now gone — give up
+                elif time.monotonic() > appearance_deadline:
+                    return False  # never showed up — bad bundle?
+
+                # Clear result file from previous iteration so we
+                # don't read a stale value.
+                try:
+                    os.unlink(result_path)
+                except OSError:
+                    pass
+
+                try:
+                    subprocess.run(
+                        [ide_cmd, 'ideScript', tmp_script_path],
+                        capture_output=True,
+                        timeout=30,
+                        env=env
+                    )
+                except subprocess.TimeoutExpired:
+                    return False
+
+                # Check result file.
+                try:
+                    with open(result_path, 'r') as f:
+                        content = f.read().strip()
+                    if content == 'QUEUED':
+                        return True
+                    # 'WAITING' or anything else — retry
+                except (OSError, IOError):
+                    pass  # File missing — IDE didn't get our request; retry
+
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.5)
         finally:
-            try:
-                os.unlink(tmp_script_path)
-            except OSError:
-                pass
+            for path in (tmp_script_path, result_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
     except (subprocess.SubprocessError, OSError):
         pass
 
