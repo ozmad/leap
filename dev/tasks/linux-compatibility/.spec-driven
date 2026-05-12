@@ -1,0 +1,17 @@
+# Spec-Driven Log: linux-compatibility
+
+## State
+Phase: requirements
+Created: 2026-05-13T00:00:00
+Last Updated: 2026-05-13T00:10:00
+Branch: (pending)
+
+---
+
+## Event Log
+<!-- Append-only. Never edit existing entries. -->
+
+[2026-05-13T00:00:00] [requirements] INIT — Task directory created. Slug: linux-compatibility
+[2026-05-13T00:01:00] [requirements] REQUIREMENTS_DRAFT — requirements.md created with 12 FRs, 5 NFRs, 10 SCs
+[2026-05-13T00:05:00] [requirements] REQUIREMENTS_REFINED — Expanded to full monitor support (not degraded); VS Code nav in scope; shell config to ~/.leap.zshrc; 21 FRs, 6 NFRs, 13 SCs
+[2026-05-13T00:10:00] [requirements] REQUIREMENTS_REFINED — Added test strategy: 3 new NFRs (narrow guards, both-branches, sentinel integrity), macOS non-regression SCs 13-17, unit test SCs 18-23 covering platform imports/sleep/clipboard/navigation/shell-config/pyproject markers
