@@ -1614,6 +1614,7 @@ class TableBuilderMixin(_Base):
             if s['tag'] == tag:
                 current_mode = s.get('auto_send_mode', AutoSendMode.PAUSE)
                 break
+        default_mode = load_settings().get('auto_send_mode', AutoSendMode.PAUSE)
 
         menu = QMenu(self)
         if self._prefs.get('show_tooltips', True):
@@ -1642,7 +1643,10 @@ class TableBuilderMixin(_Base):
 
         menu.addSeparator()
 
-        pause_action = menu.addAction('Pause on input (default)')
+        pause_label = 'Pause on input'
+        if default_mode == AutoSendMode.PAUSE:
+            pause_label += ' (default)'
+        pause_action = menu.addAction(pause_label)
         pause_action.setCheckable(True)
         pause_action.setChecked(current_mode == AutoSendMode.PAUSE)
         pause_action.setToolTip(
@@ -1657,7 +1661,10 @@ class TableBuilderMixin(_Base):
             lambda _checked, t=tag: self._set_auto_send_mode(t, AutoSendMode.PAUSE)
         )
 
-        always_action = menu.addAction('Always send')
+        always_label = 'Always send'
+        if default_mode == AutoSendMode.ALWAYS:
+            always_label += ' (default)'
+        always_action = menu.addAction(always_label)
         always_action.setCheckable(True)
         always_action.setChecked(current_mode == AutoSendMode.ALWAYS)
         always_action.setToolTip(

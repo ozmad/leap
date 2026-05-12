@@ -219,6 +219,9 @@ class MonitorWindow(
         if 'default_diff_tool' not in self._prefs:
             self._prefs['default_diff_tool'] = detect_default_difftool()
             self._save_prefs()
+        if 'hidden_columns' not in self._prefs:
+            self._prefs['hidden_columns'] = ['Client']
+            self._save_prefs()
         self._pinned_sessions: dict[str, dict[str, Any]] = load_pinned_sessions()
         self._deleted_tags: set[str] = set()  # suppress re-pin after explicit delete
         self._starting_tags: set[str] = set()  # guard against double-click server start
