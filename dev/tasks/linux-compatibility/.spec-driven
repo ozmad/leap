@@ -3,7 +3,7 @@
 ## State
 Phase: plan
 Created: 2026-05-13T00:00:00
-Last Updated: 2026-05-13T00:45:00
+Last Updated: 2026-05-13T01:00:00
 Branch: feature/linux-compatibility
 
 ---
@@ -31,4 +31,6 @@ Branch: feature/linux-compatibility
 [2026-05-13T00:30:00] [implementation] IMPL_STARTED — subtask 1: pyproject-markers
 [2026-05-13T00:30:00] [implementation] IMPL_DONE — subtask 1: added sys_platform=='darwin' markers to pyobjc-* (3), gnureadline, py2app; lockfile regenerated; test_pyproject_markers.py added; 410 tests pass, 35 pre-existing monitor import failures unaffected
 [2026-05-13T00:40:00] [implementation] IMPL_STARTED — subtask 2: pyobjc-import-guards
-[2026-05-13T00:45:00] [implementation] IMPL_DONE — subtask 2: try/except ImportError guards in app.py, navigation.py, pr_display_mixin.py, notifications_dialog.py; _HAS_COCOA + _HAS_NOTIFICATIONS sentinels; 12 new tests (both branches); 647 unit tests pass: 3 new NFRs (narrow guards, both-branches, sentinel integrity), macOS non-regression SCs 13-17, unit test SCs 18-23 covering platform imports/sleep/clipboard/navigation/shell-config/pyproject markers
+[2026-05-13T00:45:00] [implementation] IMPL_DONE — subtask 2: try/except ImportError guards in app.py, navigation.py, pr_display_mixin.py, notifications_dialog.py; _HAS_COCOA + _HAS_NOTIFICATIONS sentinels; 12 new tests (both branches); 647 unit tests pass
+[2026-05-13T00:50:00] [implementation] IMPL_STARTED — subtask 3: sleep-guard-linux
+[2026-05-13T01:00:00] [implementation] IMPL_DONE — subtask 3: SleepGuard uses systemd-inhibit on Linux; LidCloseGuard uses systemd-inhibit --what=sleep on Linux; both no-op gracefully when absent; 10 new tests all branches; 657 unit tests pass: 3 new NFRs (narrow guards, both-branches, sentinel integrity), macOS non-regression SCs 13-17, unit test SCs 18-23 covering platform imports/sleep/clipboard/navigation/shell-config/pyproject markers
