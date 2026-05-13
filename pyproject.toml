@@ -23,12 +23,12 @@ leap-slack = "leap.slack.bot:main"
 python = "^3.11"
 pexpect = "^4.8.0"
 prompt-toolkit = "^3.0.0"
-gnureadline = "^8.1.2"
+gnureadline = {version = "^8.1.2", markers = "sys_platform == 'darwin'"}
 wcwidth = "^0.6.0"
 rich = "^14.3.2"
-pyobjc-framework-cocoa = "^12.1"
-pyobjc-framework-applicationservices = "^12.1"
-pyobjc-framework-quartz = "^12.1"
+pyobjc-framework-cocoa = {version = "^12.1", markers = "sys_platform == 'darwin'"}
+pyobjc-framework-applicationservices = {version = "^12.1", markers = "sys_platform == 'darwin'"}
+pyobjc-framework-quartz = {version = "^12.1", markers = "sys_platform == 'darwin'"}
 pyte = "^0.8.2"
 
 [tool.poetry.group.dev.dependencies]
@@ -38,7 +38,7 @@ pytest = "^8.0"
 PyQt5 = "^5.15.0"
 python-gitlab = "^8.0.0"
 PyGithub = "^2.0"
-py2app = "^0.28"
+py2app = {version = "^0.28", markers = "sys_platform == 'darwin'"}
 
 [tool.poetry.group.slack]
 optional = true
