@@ -60,6 +60,42 @@ def _dir_index(project_name: str, dir_name: str) -> int:
         return -1
 
 
+def _commits_ahead_of_origin(project_dir: Path, branch: str) -> Optional[int]:
+    """Count local commits on HEAD not in ``origin/<branch>``.
+
+    Returns 0 if local is up-to-date or behind, a positive int if ahead, or
+    ``None`` if the count itself couldn't be determined (no ``origin/<branch>``
+    ref, git error, etc.). ``None`` MUST be treated as "unknown — be safe".
+
+    The count is only meaningful against a freshly-fetched ``origin/<branch>``;
+    callers should ensure a fetch ran first or accept that a stale local
+    tracking ref may inflate the count (commits already in remote but not yet
+    in local ``origin/<branch>``).
+    """
+    try:
+        r = subprocess.run(
+            ['git', 'rev-list', '--count', f'origin/{branch}..HEAD'],
+            capture_output=True, text=True,
+            cwd=str(project_dir), timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        logger.warning(
+            "Ahead-count subprocess failed for %s (%s)",
+            project_dir, branch, exc_info=True,
+        )
+        return None
+    if r.returncode != 0:
+        logger.warning(
+            "Ahead-count non-zero for %s (%s): %s",
+            project_dir, branch, (r.stderr or '').strip(),
+        )
+        return None
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
 def _dirty_files(project_dir: Path) -> Optional[list[str]]:
     """List local files a force-align would discard in this managed clone.
 
@@ -474,49 +510,105 @@ class ServerLauncher:
     def _dirty_check_then_align(
         self, tag: str, pinned: dict[str, Any], project_dir: Path, branch: str,
     ) -> None:
-        """Gate ``_server_force_align`` on a user prompt if the clone is dirty.
+        """Gate ``_server_force_align`` on a user prompt if local state would be lost.
 
         Managed clones in repos_dir get wiped on every sync — but if the
-        user has uncommitted edits (tracked or untracked) we want to
-        surface that before destroying them. Clean tree → straight to
-        align (no dialog). Dirty tree (or scan failure — treated as
+        user has uncommitted edits (working-tree changes) OR local commits
+        ahead of ``origin/<branch>`` we want to surface that before
+        destroying them. Clean + up-to-date → straight to align (no
+        dialog). Anything to lose (or scan failure — treated as
         "unknown, be safe") → 3-way prompt (clone into next / discard &
         sync / cancel).
+
+        The worker pre-fetches so the ahead-count is against current
+        remote state; ``_server_force_align`` will re-fetch (cheap when
+        unchanged), but if pre-fetch fails we proceed to align and let
+        the existing fetch-failure UI in ``_on_server_force_aligned``
+        handle it consistently.
         """
-        # Use a sentinel so we can distinguish "scan didn't run" from
-        # "scan ran, tree is clean". Default is the unknown sentinel.
-        files_box: list[Optional[list[str]]] = [None]
+        auth_url = self._build_clone_url(
+            pinned.get('host_url', ''), pinned.get('remote_project_path', ''),
+            pinned.get('scm_type', ''),
+        )
+        refspec = f'+refs/heads/{branch}:refs/remotes/origin/{branch}'
+        # state: (fetch_failed: bool, dirty: Optional[list[str]], ahead: Optional[int])
+        state: list[tuple[bool, Optional[list[str]], Optional[int]]] = [
+            (False, None, None),
+        ]
 
         def _scan() -> None:
-            files_box[0] = _dirty_files(project_dir)
+            cwd = str(project_dir)
+            if auth_url:
+                subprocess.run(
+                    ['git', 'remote', 'set-url', 'origin', auth_url],
+                    capture_output=True, text=True, cwd=cwd, timeout=5,
+                )
+            fetch_failed = False
+            try:
+                r = subprocess.run(
+                    ['git', 'fetch', 'origin', refspec],
+                    capture_output=True, text=True, cwd=cwd, timeout=30,
+                )
+                if r.returncode != 0:
+                    fetch_failed = True
+            except (subprocess.SubprocessError, OSError):
+                fetch_failed = True
+            dirty = _dirty_files(project_dir)
+            # Skip ahead-count if fetch failed — the local origin/<branch>
+            # ref is stale, so any count we report would be misleading.
+            ahead = (
+                _commits_ahead_of_origin(project_dir, branch)
+                if not fetch_failed else None
+            )
+            state[0] = (fetch_failed, dirty, ahead)
 
         w = BackgroundCallWorker(_scan, self._w)
         w.finished.connect(lambda: self._on_dirty_check(
-            tag, pinned, project_dir, branch, files_box[0],
+            tag, pinned, project_dir, branch, *state[0],
         ))
         w.finished.connect(w.deleteLater)
         w.start()
 
     def _on_dirty_check(
         self, tag: str, pinned: dict[str, Any], project_dir: Path,
-        branch: str, files: Optional[list[str]],
+        branch: str, fetch_failed: bool, dirty: Optional[list[str]],
+        ahead: Optional[int],
     ) -> None:
-        """Handle dirty-scan result: dialog if dirty/unknown, else straight to align."""
-        # The dirty scan runs in a worker, so by the time we get here the
-        # user may have deleted the row. If so, the resurrection paths in
+        """Handle scan result: dialog if anything to lose, else straight to align."""
+        # The scan runs in a worker, so by the time we get here the user
+        # may have deleted the row. If so, the resurrection paths in
         # _server_finish would re-insert ``pinned`` into _pinned_sessions
         # for a tag the user explicitly dropped.
         if tag not in self._w._pinned_sessions:
             self._cancel_start(tag)
             return
-        if files is None:
-            # Scan failed — conservatively surface a dialog so the user
-            # can pick a non-destructive path (Clone into next) rather
-            # than have us silently wipe state.
-            files = ['(could not check working tree — proceeding may discard local changes)']
-        elif not files:
+
+        # If the pre-fetch failed, defer to _server_force_align — its
+        # _on_server_force_aligned handler already prompts the user with
+        # branch-gone vs. fetch-failed-but-start-anyway choices.
+        if fetch_failed:
             self._server_force_align(tag, pinned, project_dir, branch)
             return
+
+        # Build the "what would be lost" list. Scan failures map to
+        # synthetic entries so the user still sees a prompt.
+        items: list[str] = []
+        if dirty is None:
+            items.append('(could not check working tree — proceeding may discard local changes)')
+        else:
+            items.extend(dirty)
+        if ahead is None:
+            items.append('(could not check local commits vs origin)')
+        elif ahead > 0:
+            plural = '' if ahead == 1 else 's'
+            items.append(
+                f'{ahead} local commit{plural} ahead of origin/{branch}',
+            )
+
+        if not items:
+            self._server_force_align(tag, pinned, project_dir, branch)
+            return
+
         repos_dir = Path(
             self._w._prefs.get('repos_dir', DEFAULT_REPOS_DIR).strip()
             or DEFAULT_REPOS_DIR,
@@ -535,9 +627,9 @@ class ServerLauncher:
         next_dir, _next_needs_clone, _ = self._find_available_project_dir(
             repos_dir, project_name, start_index=next_start,
         )
-        action = self._ask_dirty_action(project_dir, files, next_dir)
+        action = self._ask_dirty_action(project_dir, items, next_dir)
         # Re-check: the row could have been deleted while the modal was open
-        # (auto-refresh and other handlers still run during ``box.exec_()``).
+        # (auto-refresh and other handlers still run during ``exec_()``).
         if tag not in self._w._pinned_sessions:
             self._cancel_start(tag)
             return
@@ -556,23 +648,26 @@ class ServerLauncher:
         self._start_server_from_pr(tag, pinned, start_index=next_start)
 
     def _ask_dirty_action(
-        self, project_dir: Path, files: list[str], next_dir: Path,
+        self, project_dir: Path, items: list[str], next_dir: Path,
     ) -> str:
-        """3-way prompt for a dirty managed clone. Returns 'next'/'discard'/'cancel'.
+        """3-way prompt for a managed clone with local state to lose.
 
-        Shows the full on-disk path of both the affected dir and the
-        proposed bump target so the user can locate them in Finder/IDE.
+        ``items`` mixes file paths (working-tree dirt) and synthetic strings
+        like ``"3 local commits not in origin/<branch>"``. Returns
+        'next'/'discard'/'cancel'. Shows the full on-disk path of both the
+        affected dir and the proposed bump target so the user can locate
+        them in Finder/IDE.
 
         Built as a plain ``QDialog`` rather than ``QMessageBox`` because the
         latter follows the platform's button layout (macOS pins
         ``RejectRole`` to the middle, between Destructive and Accept). The
         product wants Cancel pinned to the bottom-left.
         """
-        shown = files[:5]
-        more = len(files) - len(shown)
-        files_text = '\n'.join(f'  • {f}' for f in shown)
+        shown = items[:5]
+        more = len(items) - len(shown)
+        items_text = '\n'.join(f'  • {f}' for f in shown)
         if more > 0:
-            files_text += f'\n  …and {more} more'
+            items_text += f'\n  …and {more} more'
 
         dialog = QDialog(self._w)
         dialog.setWindowTitle('Local Changes')
@@ -596,9 +691,9 @@ class ServerLauncher:
         msg = QLabel(
             f"The managed clone at\n"
             f"    {project_dir}\n"
-            f"has uncommitted local changes:\n\n"
-            f"{files_text}\n\n"
-            f"Syncing to the PR branch would discard them."
+            f"has local state that syncing would discard:\n\n"
+            f"{items_text}\n\n"
+            f"Syncing to the PR branch would destroy them."
         )
         # Force plain text so a path containing '<' isn't mis-parsed as HTML.
         msg.setTextFormat(Qt.PlainText)
