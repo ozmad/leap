@@ -7,9 +7,13 @@ import os
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
-import objc
-from AppKit import NSApplication, NSImage
-from Foundation import NSDictionary, NSObject, NSSet, NSUserNotification, NSUserNotificationCenter
+try:
+    import objc
+    from AppKit import NSApplication, NSImage
+    from Foundation import NSDictionary, NSObject, NSSet, NSUserNotification, NSUserNotificationCenter
+    _HAS_COCOA = True
+except ImportError:  # pragma: no cover — non-macOS / missing pyobjc
+    _HAS_COCOA = False
 from PyQt5 import sip
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QLabel

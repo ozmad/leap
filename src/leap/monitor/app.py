@@ -15,12 +15,16 @@ import sys
 import time
 from typing import Any, Optional
 
-import objc
-from AppKit import (
-    NSAppearance, NSApplication, NSEvent,
-    NSImage, NSKeyDownMask, NSWindowStyleMaskFullSizeContentView,
-)
-from Foundation import NSDate, NSMakeRect, NSRunLoop
+try:
+    import objc
+    from AppKit import (
+        NSAppearance, NSApplication, NSEvent,
+        NSImage, NSKeyDownMask, NSWindowStyleMaskFullSizeContentView,
+    )
+    from Foundation import NSDate, NSMakeRect, NSRunLoop
+    _HAS_COCOA = True
+except ImportError:  # pragma: no cover — non-macOS / missing pyobjc
+    _HAS_COCOA = False
 from PyQt5.QtWidgets import (
     QAction, QApplication, QComboBox, QDialog, QFrame, QInputDialog,
     QLineEdit, QMainWindow, QMenu, QScrollBar, QShortcut, QToolButton,
