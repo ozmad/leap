@@ -17,18 +17,22 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import AppKit
-from ApplicationServices import (
-    AXIsProcessTrusted, AXIsProcessTrustedWithOptions,
-    AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementPerformAction, kAXErrorSuccess,
-)
-from CoreFoundation import kCFBooleanTrue
-from Quartz import (
-    CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
-    kCGEventFlagMaskCommand, kCGEventFlagMaskControl,
-    kCGEventFlagMaskShift, kCGHIDEventTap,
-)
+try:
+    import AppKit
+    from ApplicationServices import (
+        AXIsProcessTrusted, AXIsProcessTrustedWithOptions,
+        AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
+        AXUIElementPerformAction, kAXErrorSuccess,
+    )
+    from CoreFoundation import kCFBooleanTrue
+    from Quartz import (
+        CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags,
+        kCGEventFlagMaskCommand, kCGEventFlagMaskControl,
+        kCGEventFlagMaskShift, kCGHIDEventTap,
+    )
+    _HAS_COCOA = True
+except ImportError:  # pragma: no cover — non-macOS / missing pyobjc
+    _HAS_COCOA = False
 
 logger = logging.getLogger(__name__)
 

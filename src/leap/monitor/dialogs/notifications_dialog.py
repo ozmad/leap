@@ -4,8 +4,12 @@ import os
 from functools import partial
 from typing import Any, Optional
 
-from AppKit import NSBeep, NSSound
-from Foundation import NSURL
+try:
+    from AppKit import NSBeep, NSSound
+    from Foundation import NSURL
+    _HAS_NOTIFICATIONS = True
+except ImportError:  # pragma: no cover — non-macOS / missing pyobjc
+    _HAS_NOTIFICATIONS = False
 from PyQt5.QtCore import QEvent, Qt, QTimer
 from PyQt5.QtGui import QCursor, QFont
 from PyQt5.QtWidgets import (
