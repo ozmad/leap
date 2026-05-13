@@ -3,7 +3,7 @@
 ## State
 Phase: plan
 Created: 2026-05-13T00:00:00
-Last Updated: 2026-05-13T00:20:00
+Last Updated: 2026-05-13T00:30:00
 Branch: feature/linux-compatibility
 
 ---
@@ -27,4 +27,6 @@ Branch: feature/linux-compatibility
 [2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 5_navigation-linux.md (M)
 [2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 6_notifications-linux.md (S)
 [2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 7_shell-config.md (M)
-[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 8_makefile-linux.md (M): 3 new NFRs (narrow guards, both-branches, sentinel integrity), macOS non-regression SCs 13-17, unit test SCs 18-23 covering platform imports/sleep/clipboard/navigation/shell-config/pyproject markers
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 8_makefile-linux.md (M)
+[2026-05-13T00:30:00] [implementation] IMPL_STARTED — subtask 1: pyproject-markers
+[2026-05-13T00:30:00] [implementation] IMPL_DONE — subtask 1: added sys_platform=='darwin' markers to pyobjc-* (3), gnureadline, py2app; lockfile regenerated; test_pyproject_markers.py added; 410 tests pass, 35 pre-existing monitor import failures unaffected: 3 new NFRs (narrow guards, both-branches, sentinel integrity), macOS non-regression SCs 13-17, unit test SCs 18-23 covering platform imports/sleep/clipboard/navigation/shell-config/pyproject markers
