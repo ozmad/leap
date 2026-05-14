@@ -13,6 +13,7 @@ Safe to run multiple times (idempotent).
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -27,14 +28,15 @@ _SETTING = "enable_csi_u_key_encoding"
 
 def _is_wezterm_installed() -> bool:
     """Check if WezTerm is installed."""
-    # macOS .app bundle in standard locations
+    # CLI binary on PATH (works on all platforms)
+    if shutil.which("wezterm") is not None:
+        return True
+    if sys.platform != 'darwin':
+        return False
+    # macOS: check .app bundle in standard locations, then Spotlight fallback
     if (Path("/Applications/WezTerm.app").is_dir()
             or Path.home().joinpath("Applications/WezTerm.app").is_dir()):
         return True
-    # CLI binary on PATH
-    if shutil.which("wezterm") is not None:
-        return True
-    # Spotlight fallback — finds the app anywhere on disk
     try:
         result = subprocess.run(
             ["mdfind", 'kMDItemCFBundleIdentifier == "com.github.wez.wezterm"'],

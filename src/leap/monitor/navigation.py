@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -91,6 +92,12 @@ def detect_supported_ide_for_move(app_path: str) -> Optional[str]:
     legacy "just open the .app" behaviour with no popup.
     """
     if not app_path:
+        # On Linux there are no .app bundles — check PATH instead.
+        if sys.platform != 'darwin':
+            if shutil.which('code'):
+                return 'VS Code'
+            if shutil.which('cursor'):
+                return 'VS Code'  # Cursor uses the same Leap extension
         return None
     bundle = os.path.basename(app_path.rstrip('/'))
     # JetBrains: only return a canonical key the downstream helper
@@ -450,6 +457,8 @@ def _navigate_jetbrains(
 ) -> bool:
     """Navigate to a terminal tab in a JetBrains IDE.
 
+    macOS only (requires AppleScript / `ideScript`). Returns False on Linux.
+
     Polls ``ideScript`` until the Groovy template (which is
     instrumented to write a ``QUEUED``/``WAITING`` sentinel to a
     temp file — see ``resources/activate_terminal.groovy``) reports
@@ -463,6 +472,8 @@ def _navigate_jetbrains(
     disappeared, or IDE never appeared within the 30 s appearance
     grace.
     """
+    if sys.platform != 'darwin':
+        return False
     script_dir = Path(__file__).parent
     groovy_script = script_dir / "resources" / "activate_terminal.groovy"
 
@@ -596,10 +607,29 @@ def _navigate_vscode(
 ) -> bool:
     """Navigate to VS Code/Cursor window and select terminal tab by name.
 
-    Uses AppleScript to focus the correct window (matching the project
-    folder name) instead of the CLI, which would open a new window or
-    replace the current workspace.
+    macOS: AppleScript window focus + ~/.leap-terminal-request file trigger.
+    Linux: ``code --reuse-window`` focus + same file trigger.
     """
+    if sys.platform != 'darwin':
+        code_bin = shutil.which('code') if ide == 'VS Code' else shutil.which('cursor')
+        if code_bin and project_path:
+            try:
+                subprocess.run(
+                    [code_bin, '--reuse-window', project_path],
+                    capture_output=True, timeout=5,
+                )
+                time.sleep(0.3)
+            except (subprocess.SubprocessError, OSError):
+                pass
+        request_file = os.path.expanduser('~/.leap-terminal-request')
+        try:
+            with open(request_file, 'w') as f:
+                f.write(terminal_name)
+            time.sleep(0.1)
+        except OSError:
+            pass
+        return True
+
     try:
         app_name = _vscode_applescript_name(ide)
         # Focus the window whose title contains the project folder name
@@ -654,7 +684,9 @@ def _navigate_vscode(
 
 
 def _navigate_terminal_app(title_pattern: str) -> bool:
-    """Navigate to terminal in Terminal.app."""
+    """Navigate to terminal in Terminal.app (macOS only)."""
+    if sys.platform != 'darwin':
+        return False
     safe_pattern = _escape_applescript(title_pattern)
     script = f'''
     tell application "Terminal"
@@ -688,11 +720,9 @@ def _navigate_terminal_app(title_pattern: str) -> bool:
 
 
 def _navigate_arduino(_title_pattern: str) -> bool:
-    """Navigate to Arduino IDE.
-
-    Arduino IDE (Theia-based) has a single terminal, so just
-    activate the app window.
-    """
+    """Navigate to Arduino IDE (macOS only)."""
+    if sys.platform != 'darwin':
+        return False
     script = '''
     tell application "Arduino IDE"
         activate
@@ -714,7 +744,9 @@ def _navigate_arduino(_title_pattern: str) -> bool:
 
 
 def _navigate_iterm2(title_pattern: str) -> bool:
-    """Navigate to terminal in iTerm2."""
+    """Navigate to terminal in iTerm2 (macOS only)."""
+    if sys.platform != 'darwin':
+        return False
     safe_pattern = _escape_applescript(title_pattern)
     script = f'''
     tell application "iTerm"
@@ -988,11 +1020,13 @@ def _find_wezterm_cli() -> Optional[str]:
     cli = shutil.which('wezterm')
     if cli:
         return cli
+    if sys.platform != 'darwin':
+        return None
+    # macOS: check known .app bundle locations, then Spotlight fallback
     for app_dir in ('/Applications', os.path.expanduser('~/Applications')):
         candidate = os.path.join(app_dir, 'WezTerm.app', 'Contents', 'MacOS', 'wezterm')
         if os.path.isfile(candidate):
             return candidate
-    # Spotlight fallback — finds the app even if installed in ~/Downloads etc.
     try:
         result = subprocess.run(
             ['mdfind', f'kMDItemCFBundleIdentifier == "{_WEZTERM_BUNDLE_ID}"'],
@@ -1022,16 +1056,29 @@ def _wezterm_list_panes(cli: str) -> list[dict[str, Any]]:
 
 
 def _activate_wezterm() -> bool:
-    """Bring WezTerm to the foreground."""
-    try:
-        result = subprocess.run(
-            ['open', '-a', 'WezTerm'],
-            capture_output=True, timeout=5,
-        )
-        return result.returncode == 0
-    except (subprocess.SubprocessError, OSError):
-        pass
-    return False
+    """Bring WezTerm to the foreground (best-effort on both platforms)."""
+    if sys.platform == 'darwin':
+        try:
+            result = subprocess.run(
+                ['open', '-a', 'WezTerm'],
+                capture_output=True, timeout=5,
+            )
+            return result.returncode == 0
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return False
+    # Linux: try wmctrl then xdotool; best-effort (pane already activated via cli)
+    for cmd in (
+        ['wmctrl', '-a', 'WezTerm'],
+        ['xdotool', 'search', '--name', 'WezTerm', 'windowfocus'],
+    ):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=3)
+            except (subprocess.SubprocessError, OSError):
+                pass
+            return True
+    return True  # best-effort — pane navigation already succeeded
 
 
 def _navigate_wezterm(title_pattern: str) -> bool:
@@ -1110,13 +1157,15 @@ _WARP_BUNDLE_ID = 'dev.warp.Warp-Stable'
 
 
 def _get_app_pid(bundle_id: str) -> Optional[int]:
-    """Get PID for a running app by bundle identifier.
+    """Get PID for a running app by bundle identifier (macOS only).
 
     Uses NSWorkspace iteration instead of
     runningApplicationsWithBundleIdentifier_ because the latter can
     return empty results when called from a background thread in a
     py2app bundle.
     """
+    if not _HAS_COCOA:
+        return None
     try:
         workspace = AppKit.NSWorkspace.sharedWorkspace()
         for app in workspace.runningApplications():
@@ -1128,12 +1177,14 @@ def _get_app_pid(bundle_id: str) -> Optional[int]:
 
 
 def _check_accessibility_trusted() -> bool:
-    """Check if this process has Accessibility permission.
+    """Check if this process has Accessibility permission (macOS only).
 
     If not trusted, triggers the macOS system prompt to request permission.
     This handles the case where the .app was rebuilt (changing its ad-hoc
     code signature) and the old Accessibility entry is now stale.
     """
+    if not _HAS_COCOA:
+        return False
     trusted = AXIsProcessTrusted()
     if trusted:
         return True
@@ -1152,11 +1203,13 @@ def _check_accessibility_trusted() -> bool:
 
 
 def _ensure_app_focused(ns_app: Any) -> bool:
-    """Activate an app and wait until it is actually frontmost (up to 2s).
+    """Activate an app and wait until it is actually frontmost (macOS only).
 
     ``activateWithOptions_`` is asynchronous — this helper polls
     ``isActive`` so that subsequent CGEvent keystrokes hit the right app.
     """
+    if not _HAS_COCOA:
+        return False
     ns_app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
     for _ in range(20):
         if ns_app.isActive():
@@ -1168,7 +1221,9 @@ def _ensure_app_focused(ns_app: Any) -> bool:
 def _send_keystroke(
     keycode: int, cmd: bool = False, shift: bool = False, ctrl: bool = False,
 ) -> bool:
-    """Send a keystroke to the frontmost application using CGEvent."""
+    """Send a keystroke to the frontmost application using CGEvent (macOS only)."""
+    if not _HAS_COCOA:
+        return False
     flags = 0
     if cmd:
         flags |= kCGEventFlagMaskCommand
@@ -1269,11 +1324,9 @@ def _close_warp(title_pattern: str) -> bool:
 
 
 def _activate_warp() -> bool:
-    """Bring Warp to front without Accessibility permission.
-
-    Cannot target a specific window — just activates the application.
-    Used as a fallback when Accessibility permission is not granted.
-    """
+    """Bring Warp to front without Accessibility permission (macOS only)."""
+    if sys.platform != 'darwin':
+        return False
     script = '''
     tell application "Warp" to activate
     return true
@@ -1290,6 +1343,25 @@ def _activate_warp() -> bool:
         pass
 
     return False
+
+
+def _copy_to_clipboard(text: str) -> None:
+    """Copy *text* to system clipboard (macOS and Linux, best-effort)."""
+    if sys.platform == 'darwin':
+        try:
+            subprocess.run(
+                ['pbcopy'], input=text.encode('utf-8'), capture_output=True, timeout=2,
+            )
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return
+    for cmd in (['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode('utf-8'), capture_output=True, timeout=2)
+                return
+            except (subprocess.SubprocessError, OSError):
+                pass
 
 
 def _open_warp_terminal(command: str) -> bool:
@@ -1364,14 +1436,7 @@ def _type_command_in_warp(pid: int, command: str) -> bool:
     time.sleep(1.0)
 
     # Copy command to clipboard
-    try:
-        proc = subprocess.run(
-            ['pbcopy'], input=command.encode('utf-8'), timeout=2,
-        )
-        if proc.returncode != 0:
-            return False
-    except (subprocess.SubprocessError, OSError):
-        return False
+    _copy_to_clipboard(command)
 
     # Re-focus Warp (user may have switched away during the wait)
     if not _ensure_app_focused(ns_app):
@@ -1441,14 +1506,7 @@ def _open_warp_tab_with_keystroke(pid: int, command: str) -> bool:
             break
 
     # Copy command to clipboard (done once, reused across retries)
-    try:
-        proc = subprocess.run(
-            ['pbcopy'], input=command.encode('utf-8'), timeout=2,
-        )
-        if proc.returncode != 0:
-            return False
-    except (subprocess.SubprocessError, OSError):
-        return False
+    _copy_to_clipboard(command)
 
     # Re-focus Warp (user may have switched away during the wait)
     if not _ensure_app_focused(ns_app):
@@ -1849,7 +1907,9 @@ fw.close()
 
 
 def _open_terminal_app_terminal(command: str) -> bool:
-    """Open a new Terminal.app tab and run a command."""
+    """Open a new Terminal.app tab and run a command (macOS only)."""
+    if sys.platform != 'darwin':
+        return False
     escaped = command.replace('\\', '\\\\').replace('"', '\\"')
     script = f'''
     tell application "Terminal"
@@ -1874,11 +1934,13 @@ def _open_terminal_app_terminal(command: str) -> bool:
 
 
 def _open_iterm2_terminal(command: str) -> bool:
-    """Open a new iTerm2 tab and run a command.
+    """Open a new iTerm2 tab and run a command (macOS only).
 
     Creates a new window if none exists, otherwise opens a new tab
     in the current window.
     """
+    if sys.platform != 'darwin':
+        return False
     escaped = command.replace('\\', '\\\\').replace('"', '\\"')
     script = f'''
     tell application "iTerm"

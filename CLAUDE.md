@@ -497,7 +497,8 @@ Bot can also be started/stopped from the monitor's **Slack Bot** button. Depende
 
 ```bash
 make install           # Install core + configure shell
-make install-monitor   # Build and install GUI app
+make install-monitor   # Build and install GUI app (macOS); prints skip message on Linux
+make install-monitor-deps  # Install monitor Python deps without building the app (Linux)
 make install-slack-app # Install Slack integration + setup wizard
 make reconfigure       # Re-run per-machine integration steps (hooks + IDE/terminal/shell configures); skips deps, monitor, slack, git pull. Use after installing a new CLI/IDE/terminal post-Leap. Same target leap --reconfigure execs into.
 make test              # Run the full test suite (unit + integration)
