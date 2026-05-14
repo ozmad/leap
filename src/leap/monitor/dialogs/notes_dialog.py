@@ -352,6 +352,7 @@ class NotesDialog(_NotesFindBarMixin, QDialog):
             '  |  Cmd+/\u2212/0/Scroll: Zoom'
             '  |  Cmd+Z/Shift+Z: Undo/Redo'
             '  |  Delete/\u232b: Delete  |  Right-click: More')
+        hint.setWordWrap(True)
         hint.setStyleSheet(
             f'color: {current_theme().text_muted};')
         self._bottom_hint = hint
