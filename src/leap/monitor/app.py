@@ -2438,16 +2438,17 @@ class MonitorWindow(
         r = t.border_radius
 
         # Set macOS appearance (dark/light) — must come before palette
-        try:
-            appearance_name = (
-                'NSAppearanceNameDarkAqua' if t.is_dark
-                else 'NSAppearanceNameAqua'
-            )
-            appearance = NSAppearance.appearanceNamed_(appearance_name)
-            if appearance:
-                NSApplication.sharedApplication().setAppearance_(appearance)
-        except Exception:
-            pass
+        if _HAS_COCOA:
+            try:
+                appearance_name = (
+                    'NSAppearanceNameDarkAqua' if t.is_dark
+                    else 'NSAppearanceNameAqua'
+                )
+                appearance = NSAppearance.appearanceNamed_(appearance_name)
+                if appearance:
+                    NSApplication.sharedApplication().setAppearance_(appearance)
+            except Exception:
+                pass
 
         app = QApplication.instance()
 
@@ -3743,16 +3744,17 @@ def main() -> None:
 
     # Set macOS appearance based on theme (dark/light)
     t = current_theme()
-    try:
-        appearance_name = (
-            'NSAppearanceNameDarkAqua' if t.is_dark
-            else 'NSAppearanceNameAqua'
-        )
-        appearance = NSAppearance.appearanceNamed_(appearance_name)
-        if appearance:
-            NSApplication.sharedApplication().setAppearance_(appearance)
-    except Exception:
-        pass
+    if _HAS_COCOA:
+        try:
+            appearance_name = (
+                'NSAppearanceNameDarkAqua' if t.is_dark
+                else 'NSAppearanceNameAqua'
+            )
+            appearance = NSAppearance.appearanceNamed_(appearance_name)
+            if appearance:
+                NSApplication.sharedApplication().setAppearance_(appearance)
+        except Exception:
+            pass
 
     # Set app icon for Dock and macOS notifications
     icon_path = find_icon()

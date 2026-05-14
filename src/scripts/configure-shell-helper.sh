@@ -20,19 +20,20 @@ if [ "$1" = "--update" ]; then
 fi
 REPO_PATH="${1:-$(git rev-parse --show-toplevel 2>/dev/null)}"
 
-# Get shell RC file
+# Step 1 — Detect shell and set file names.
 SHELL_NAME=$(basename "$SHELL")
 if [ "$SHELL_NAME" = "zsh" ]; then
     RC_FILE="$HOME/.zshrc"
+    LEAP_RC="$HOME/.leap.zshrc"
 elif [ "$SHELL_NAME" = "bash" ]; then
     RC_FILE="$HOME/.bashrc"
+    LEAP_RC="$HOME/.leap.bashrc"
 else
-    echo -e "${YELLOW}⚠ Unknown shell: $SHELL_NAME${NC}"
-    echo "  Please manually add configuration to your shell RC file."
+    echo -e "${YELLOW}⚠ Unknown shell: $SHELL_NAME — please source ~/.leap.zshrc manually${NC}"
     exit 0
 fi
 
-# Remove legacy LEAP_*_FLAGS exports (now stored in .storage/cli_flags.json)
+# Step 2 — Remove legacy LEAP_*_FLAGS exports (stored in .storage/cli_flags.json now).
 if [ -f "$RC_FILE" ]; then
     sed_inplace '/^export LEAP_[A-Z_]*_FLAGS="/d' "$RC_FILE"
     sed_inplace '/^# Default flags per CLI/d' "$RC_FILE"
@@ -41,10 +42,8 @@ if [ -f "$RC_FILE" ]; then
     sed_inplace '/^#        leap-cleanup$/d' "$RC_FILE"
 fi
 
-# Silently strip any existing Leap block. The content is 100% regenerated
-# from this script — hand-edits between the START/END markers are not
-# protected (users are expected to customize outside the block).
-stripped=false
+# Step 3 — Migrate legacy START/END block (or pre-marker heuristic).
+migrated=false
 if grep -q "Leap Configuration START" "$RC_FILE" 2>/dev/null; then
     sed_inplace '/Leap Configuration START/,/Leap Configuration END/d' "$RC_FILE"
     stripped=true
@@ -63,7 +62,7 @@ if [ "$stripped" = true ] && [ -s "$RC_FILE" ]; then
         "$RC_FILE" > "$RC_FILE.trim" && replace_file "$RC_FILE.trim" "$RC_FILE"
 fi
 
-# Get Poetry venv path (try stored path first, then poetry command)
+# Step 4 — Get Poetry venv path (try stored path first, then poetry command).
 VENV_PATH_FILE="$REPO_PATH/.storage/venv-path"
 if [ -f "$VENV_PATH_FILE" ]; then
     POETRY_VENV=$(cat "$VENV_PATH_FILE")
@@ -71,25 +70,25 @@ else
     POETRY_VENV=$(cd "$REPO_PATH" && poetry env info --path 2>/dev/null || echo "")
 fi
 
-# Add Leap configuration
-cat >> "$RC_FILE" <<'EOF'
+# Step 5 — Write ~/.leap.zshrc (or ~/.leap.bashrc) atomically.
+LEAP_RC_DIR=$(dirname "$LEAP_RC")
+TMP_RC=$(mktemp "${LEAP_RC}.XXXXXX")
 
-# ===== Leap Configuration START - DO NOT REMOVE =====
-EOF
+cat > "$TMP_RC" <<'BLOCK'
+# Leap shell configuration — managed by 'make install'. Do not edit directly.
+BLOCK
 
-echo "export LEAP_PROJECT_DIR=\"$REPO_PATH\"" >> "$RC_FILE"
+echo "export LEAP_PROJECT_DIR=\"$REPO_PATH\"" >> "$TMP_RC"
 
-cat >> "$RC_FILE" <<'EOF'
+cat >> "$TMP_RC" <<'BLOCK'
 
 leap() {
     "$LEAP_PROJECT_DIR/src/scripts/leap-select.sh" "$@"
 }
-EOF
+BLOCK
 
-# Fast-path compdef if the user's framework (oh-my-zsh/prezto/etc) already
-# ran compinit — skips a 100–500ms fpath rescan on every shell start.
 if [ "$SHELL_NAME" = "zsh" ]; then
-    cat >> "$RC_FILE" <<'EOF'
+    cat >> "$TMP_RC" <<'BLOCK'
 
 # Tab-complete `leap` flags
 if [ -f "$LEAP_PROJECT_DIR/src/scripts/_leap" ]; then
@@ -100,13 +99,22 @@ if [ -f "$LEAP_PROJECT_DIR/src/scripts/_leap" ]; then
         autoload -Uz compinit && compinit -u
     fi
 fi
-EOF
+BLOCK
 fi
 
-cat >> "$RC_FILE" <<'EOF'
+mv "$TMP_RC" "$LEAP_RC"
 
-# ===== Leap Configuration END - DO NOT REMOVE =====
-EOF
+# Step 6 — Add source line to main rc (idempotent).
+LEAP_RC_BASENAME=$(basename "$LEAP_RC")
+SOURCE_LINE="[ -f \"\$HOME/$LEAP_RC_BASENAME\" ] && source \"\$HOME/$LEAP_RC_BASENAME\""
+if ! grep -qF "$LEAP_RC_BASENAME" "$RC_FILE" 2>/dev/null; then
+    echo "" >> "$RC_FILE"
+    echo "$SOURCE_LINE" >> "$RC_FILE"
+fi
 
-echo -e "${GREEN}✓ Added Leap configuration to $RC_FILE${NC}"
+# Step 7 — Report.
+if [ "$migrated" = true ]; then
+    echo -e "${GREEN}ℹ Migrated Leap config → $LEAP_RC${NC}"
+fi
+echo -e "${GREEN}✓ Leap shell config written to $LEAP_RC${NC}"
 echo "  Using Poetry venv: $POETRY_VENV"

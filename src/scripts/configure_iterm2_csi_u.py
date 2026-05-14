@@ -82,6 +82,8 @@ def configure() -> bool:
 
 
 def main() -> None:
+    if sys.platform != 'darwin':
+        return  # iTerm2 is macOS-only
     if not _is_iterm2_installed():
         return
 

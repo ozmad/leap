@@ -1,6 +1,7 @@
 PACKAGE_NAME     := leap
 PYTHON_VERSION   := "3.12"
 REPO_PATH        := $(shell git rev-parse --show-toplevel)
+UNAME            := $(shell uname)
 PROMPT_PREFIX    := "→"
 SRC_DIR          := $(REPO_PATH)/src
 SCRIPTS_DIR      := $(SRC_DIR)/scripts
@@ -105,6 +106,11 @@ endef
 # inodes; a bare `open` would just bring that stale process to front.
 # Quit-then-launch forces a fresh spawn against the new bundle on disk.
 define BUILD_MONITOR_APP
+if [ "$$(uname)" != "Darwin" ]; then \
+	echo "$(YELLOW)ℹ Monitor app build skipped on Linux (py2app is macOS-only).$(NC)"; \
+	echo "  Run 'make run-monitor' to launch the monitor from source."; \
+	exit 0; \
+fi; \
 echo "$(PROMPT_PREFIX) Building Leap Monitor.app with py2app..."; \
 cd $(REPO_PATH) && poetry run python setup.py py2app --dist-dir .dist > /dev/null 2>&1; \
 echo "$(PROMPT_PREFIX) Signing Leap Monitor.app with Leap Self-Signed cert..."; \
@@ -198,8 +204,7 @@ default: install
 .PHONY: check-macos
 check-macos:
 	@if [ "$$(uname)" != "Darwin" ]; then \
-		echo "$(YELLOW)⚠ Leap is only supported on macOS$(NC)"; \
-		exit 1; \
+		echo "$(YELLOW)ℹ Running on Linux — macOS-only features will be skipped.$(NC)"; \
 	fi
 
 .PHONY: check-python
@@ -350,7 +355,9 @@ write-install-metadata: ensure-storage
 	@echo "   Saved project: $$(cat $(REPO_PATH)/.storage/project-path)"
 
 .PHONY: install-monitor
-install-monitor: .env ensure-storage write-install-metadata .gen-codesign-cert
+install-monitor: .env ensure-storage write-install-metadata
+ifeq ($(UNAME),Darwin)
+	@$(MAKE) .gen-codesign-cert
 	@echo "$(PROMPT_PREFIX) Installing monitor dependencies..."
 	@poetry install --no-root --with monitor
 	@$(BUILD_MONITOR_APP)
@@ -365,9 +372,62 @@ install-monitor: .env ensure-storage write-install-metadata .gen-codesign-cert
 	@echo "  • Finder: Open Leap Monitor.app from Applications or ~/Applications"
 	@echo "  • Dock: Pin it for quick access"
 	@echo ""
-	@echo "$(YELLOW)Note:$(NC) Leap Monitor will prompt for Accessibility and Notifications"
-	@echo "      permissions on first launch. Grant them from the in-app banners —"
-	@echo "      this is a one-time step that persists across future updates."
+	@echo "$(YELLOW)Optional: Grant macOS permissions for full functionality$(NC)"
+	@echo ""
+	@echo "  $(YELLOW)Accessibility$(NC) — Required for IDE terminal navigation"
+	@read -p "  Open Accessibility settings? (Y/n) " -n 1 -r REPLY_ACC; echo; \
+	if [ "$$REPLY_ACC" != "n" ] && [ "$$REPLY_ACC" != "N" ]; then \
+		open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"; \
+	fi
+	@$(MAKE) .prompt-notifications
+else
+	@echo "$(YELLOW)ℹ Monitor app build requires macOS (py2app).$(NC)"
+	@echo "  Use 'make run-monitor' to launch from source on Linux."
+endif
+
+.PHONY: .prompt-notifications
+.prompt-notifications:
+ifeq ($(UNAME),Darwin)
+	@echo ""
+	@echo "$(YELLOW)Notifications — required for banner / Slack / PR alerts$(NC)"
+	@if pgrep -f "Leap Monitor.app" > /dev/null 2>&1; then \
+		echo "  Leap Monitor is already running — can't probe permission state."; \
+		echo "  Quit the app and run 'make install-monitor' again, or enable it"; \
+		echo "  directly in System Settings > Notifications > Leap Monitor."; \
+	else \
+		if [ -f "/Applications/Leap Monitor.app/Contents/MacOS/Leap Monitor" ]; then \
+			LEAP_BIN="/Applications/Leap Monitor.app/Contents/MacOS/Leap Monitor"; \
+		elif [ -f "$$HOME/Applications/Leap Monitor.app/Contents/MacOS/Leap Monitor" ]; then \
+			LEAP_BIN="$$HOME/Applications/Leap Monitor.app/Contents/MacOS/Leap Monitor"; \
+		else \
+			LEAP_BIN=""; \
+		fi; \
+		if [ -z "$$LEAP_BIN" ]; then \
+			echo "  Could not find Leap Monitor binary to probe notification permissions."; \
+			echo "  If notifications are not working, enable them in"; \
+			echo "  System Settings > Notifications > Leap Monitor."; \
+		else \
+			"$$LEAP_BIN" --request-permissions 2>/dev/null; \
+			NOTIF_STATUS=$$?; \
+			if [ "$$NOTIF_STATUS" = "0" ]; then \
+				echo "  $(GREEN)✓ Notifications permission OK.$(NC)"; \
+			elif [ "$$NOTIF_STATUS" = "2" ]; then \
+				echo "  Notifications declined — you can enable them later in"; \
+				echo "  System Settings if you change your mind."; \
+			elif [ "$$NOTIF_STATUS" -ge 126 ] 2>/dev/null; then \
+				echo "  $(YELLOW)⚠ Notification probe was blocked (process terminated externally).$(NC)"; \
+				echo "  If notifications are not working, enable them in"; \
+				echo "  System Settings > Notifications > Leap Monitor."; \
+			else \
+				printf "  Open Notifications settings? (Y/n) "; \
+				read -n 1 -r REPLY_NOTIF; echo; \
+				if [ "$$REPLY_NOTIF" != "n" ] && [ "$$REPLY_NOTIF" != "N" ]; then \
+					open "x-apple.systempreferences:com.apple.Notifications-Settings.extension"; \
+				fi; \
+			fi; \
+		fi; \
+	fi
+endif
 
 .PHONY: install-slack-app
 install-slack-app: .env ensure-storage write-install-metadata
@@ -376,6 +436,12 @@ install-slack-app: .env ensure-storage write-install-metadata
 	@mkdir -p "$(REPO_PATH)/.storage/slack"
 	@chmod +x $(SCRIPTS_DIR)/setup-slack-app.sh
 	@$(SCRIPTS_DIR)/setup-slack-app.sh "$(REPO_PATH)"
+
+.PHONY: install-monitor-deps
+install-monitor-deps:
+	@echo "$(PROMPT_PREFIX) Installing monitor dependencies..."
+	@poetry install --no-root --with monitor
+	@echo "$(GREEN)✓ Monitor dependencies installed. Run 'make run-monitor' to launch.$(NC)"
 
 .PHONY: run-monitor
 run-monitor:
@@ -904,8 +970,10 @@ uninstall-monitor:
 	@echo "$(PROMPT_PREFIX) Uninstalling Leap Monitor..."
 	@if pgrep -f "Leap Monitor" > /dev/null 2>&1; then \
 		echo "$(PROMPT_PREFIX) Closing running Leap Monitor..."; \
-		osascript -e 'quit app "Leap Monitor"' 2>/dev/null || true; \
-		sleep 1; \
+		if [ "$$(uname)" = "Darwin" ]; then \
+			osascript -e 'quit app "Leap Monitor"' 2>/dev/null || true; \
+			sleep 1; \
+		fi; \
 		pkill -f "Leap Monitor" 2>/dev/null || true; \
 	fi
 	@REMOVED=no; \
