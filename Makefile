@@ -479,6 +479,14 @@ update: .env
 	@$(MAKE) .configure-wezterm
 	@echo "$(GREEN)✓ IDE/terminal configurations updated$(NC)"
 	@$(MAKE) .configure-hooks
+	@# Remove the update-in-progress marker that leap-update.sh wrote
+	@# before its `git pull`.  Phase 2 has now completed successfully, so
+	@# WhatsNewDialog should fall back to showing `HEAD..origin/main` and
+	@# UpdateCheckWorker should resume its background fetches.  If phase 2
+	@# aborts before reaching this line, the marker is left in place and
+	@# the 30-min stale-timestamp fallback in the readers handles it.
+	@# `make update` (without leap-update.sh) harmlessly no-ops on missing file.
+	@rm -f "$(REPO_PATH)/.storage/update_in_progress"
 	@echo ""; \
 	echo "$(GREEN)✓ Leap updated successfully!$(NC)"; \
 	echo ""; \
