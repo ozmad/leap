@@ -3,10 +3,13 @@ both the server (select_option/custom_answer handlers) and the monitor
 (right-click permission menu).
 """
 
+import signal
+import time
+
 import pytest
 
 from leap.cli_providers import get_provider
-from leap.utils.menu import extract_menu_options
+from leap.utils.menu import MENU_OPTION_RE, extract_menu_options
 
 
 class TestExtractMenuOptions:
@@ -189,3 +192,107 @@ class TestExtractMenuOptions:
         # row when prose appears anywhere in the snapshot).
         prompt = "1 file changed\n12 minutes remaining\n"
         assert extract_menu_options(prompt, get_provider('claude')) == []
+
+    def test_bordered_dialog_with_cursor(self) -> None:
+        # When Claude's Ink TUI wraps the permission dialog in a bordered
+        # box, the SELECTED row in pyte's buffer reads as
+        # "│ ❯ 1. Yes" — TWO non-digit-non-space clusters (border + cursor)
+        # separated by whitespace before the digit.  Without multi-cluster
+        # prefix support, only the unselected rows (single border cluster)
+        # parsed, so the parser returned [(2, "Yes, allow..."), (3, "No")]
+        # and auto-approve's letters-only "Yes" search came up empty —
+        # the dialog sat indefinitely even with Always-send mode on.
+        prompt = (
+            "Do you want to proceed?\n"
+            "│ ❯ 1. Yes\n"
+            "│   2. Yes, allow reading from v1/ during this session\n"
+            "│   3. No\n"
+        )
+        assert extract_menu_options(prompt, get_provider('claude')) == [
+            (1, "Yes"),
+            (2, "Yes, allow reading from v1/ during this session"),
+            (3, "No"),
+        ]
+
+    def test_double_cursor_overdraw(self) -> None:
+        # Ink TUI overdraw can leave a stale cursor glyph from a previous
+        # frame next to the new cursor on the selected row — visually you
+        # see "❯ ❯ 1. Yes" because Ink doesn't always clear-to-EOL when
+        # re-rendering.  Auto-approve must still find option 1's "Yes".
+        prompt = (
+            "Do you want to proceed?\n"
+            "❯ ❯ 1. Yes\n"
+            "    2. Yes, allow always\n"
+            "    3. No\n"
+        )
+        assert extract_menu_options(prompt, get_provider('claude')) == [
+            (1, "Yes"),
+            (2, "Yes, allow always"),
+            (3, "No"),
+        ]
+
+    def test_inline_prose_with_numbered_list_does_not_auto_approve(
+        self,
+    ) -> None:
+        # Safety net for the relaxed multi-cluster prefix: an assistant
+        # response that happens to embed "<words> 1. <text>" on one line
+        # now parses as a menu option (label = everything after "1. ").
+        # That's harmless because auto-approve's letters-only "Yes"
+        # check refuses to act on a label whose letters don't reduce to
+        # exactly "yes".  Pin that contract here so a future regex
+        # tweak can't silently make auto-approve fire on prose.
+        prompt = "The plan is: 1. read file, 2. modify it, 3. commit\n"
+        options = extract_menu_options(prompt, get_provider('claude'))
+        # The parser now extracts a (1, ...) tuple — that's fine; what
+        # matters is none of the labels reduce to letters == "yes".
+        for _num, label in options:
+            letters = ''.join(c for c in label if c.isalpha()).lower()
+            assert letters != 'yes', (
+                f'label {label!r} reduces to {letters!r} — auto-approve '
+                f'would incorrectly fire on conversational prose'
+            )
+
+    @pytest.mark.skipif(
+        not hasattr(signal, 'SIGALRM'),
+        reason='SIGALRM not available on Windows',
+    )
+    def test_no_catastrophic_backtracking_on_periods_in_prose(self) -> None:
+        # The multi-cluster prefix relaxation MUST use possessive
+        # quantifiers (`++`, `*+`).  A plain `*` would catastrophically
+        # backtrack on no-match lines that contain a mid-sentence period
+        # — e.g. "Claude has written up a plan. Would you like to
+        # proceed?" — because the regex engine explores exponentially
+        # many ways to split the prefix into clusters before giving up.
+        # This pins the behavior: every line below must resolve in well
+        # under a second.  A non-possessive replacement would blow past
+        # the 2-second alarm and hang the auto-sender thread in
+        # production.
+        pathological_lines = [
+            'Claude has written up a plan. Would you like to proceed?',
+            'I will now do the following. First read. Then write. Then commit.',
+            'Step A. Step B. Step C. Step D. Step E. Step F. Step G. Step H.',
+            'a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z. Done!',
+        ]
+        previous = signal.signal(signal.SIGALRM, _raise_timeout)
+        try:
+            for line in pathological_lines:
+                signal.alarm(2)
+                start = time.time()
+                try:
+                    MENU_OPTION_RE.match(line)
+                finally:
+                    signal.alarm(0)
+                elapsed = time.time() - start
+                assert elapsed < 0.5, (
+                    f'regex took {elapsed:.3f}s on {line!r} — '
+                    f'catastrophic backtracking has been reintroduced; '
+                    f'possessive quantifiers (`++`/`*+`) are required'
+                )
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+
+
+def _raise_timeout(_signum: int, _frame: object) -> None:
+    raise TimeoutError(
+        'regex hung — catastrophic backtracking reintroduced'
+    )
