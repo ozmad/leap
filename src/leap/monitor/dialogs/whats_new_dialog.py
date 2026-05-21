@@ -1,8 +1,12 @@
 """'What's new' dialog — list commits in HEAD..origin/main (read-only)."""
 
 import html
+import json
 import logging
+import os
+import re
 import subprocess
+import time
 from typing import Optional
 
 from PyQt5.QtWidgets import (
@@ -17,6 +21,15 @@ from leap.monitor.pr_tracking.config import load_dialog_geometry, save_dialog_ge
 from leap.monitor.themes import current_theme
 
 logger = logging.getLogger(__name__)
+
+# Marker written by leap-update.sh before its `git pull` and removed by
+# `.update-after-pull` on success. While present, the dialog shows the
+# commits being installed (range starts at the marker's pre_pull_sha)
+# instead of HEAD..origin/main — otherwise the dialog would be empty
+# once the pull advances HEAD past origin/main.
+_MARKER_REL_PATH = os.path.join('.storage', 'update_in_progress')
+_MARKER_STALE_SECONDS = 30 * 60
+_SHA_RE = re.compile(r'^[0-9a-f]{7,40}$')
 
 
 class WhatsNewDialog(ZoomMixin, QDialog):
@@ -34,6 +47,14 @@ class WhatsNewDialog(ZoomMixin, QDialog):
         self._repo_path = repo_path
 
         layout = QVBoxLayout(self)
+
+        # Banner shown only while a `leap --update` is in progress.
+        # Stays hidden in the normal HEAD..origin/main case.
+        self._banner = QLabel()
+        self._banner.setWordWrap(True)
+        self._banner.setContentsMargins(12, 8, 12, 0)
+        self._banner.setVisible(False)
+        layout.addWidget(self._banner)
 
         self._list = QListWidget()
         self._list.setSpacing(6)
@@ -71,14 +92,64 @@ class WhatsNewDialog(ZoomMixin, QDialog):
             if w is not None:
                 it.setSizeHint(w.sizeHint())
 
+    def _compute_range(self) -> tuple[str, Optional[str]]:
+        """Pick the git log range and an optional banner.
+
+        Default: ``HEAD..origin/main`` (no banner).
+        When a ``leap --update`` is in progress, the marker file lets us
+        switch to ``<pre_pull_sha>..origin/main`` so the user keeps
+        seeing the commits being installed even after the pull has
+        advanced HEAD past origin/main. Stale-fallback (>30 min) and
+        any parse failure silently revert to the default — the dialog
+        must never break because of a malformed marker.
+        """
+        default = ('HEAD..origin/main', None)
+        marker_path = os.path.join(self._repo_path, _MARKER_REL_PATH)
+        try:
+            with open(marker_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return default
+        # Defensive: json.load can return any JSON type. ``data.get(...)``
+        # would raise AttributeError on a list/scalar root, which our
+        # except clause above doesn't catch.
+        if not isinstance(data, dict):
+            return default
+        started_at = data.get('started_at')
+        # bool is a subclass of int — reject it explicitly so a stray
+        # ``"started_at": true`` doesn't read as the epoch second 1.
+        if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
+            return default
+        elapsed = time.time() - float(started_at)
+        # Negative elapsed = started_at in the future (clock skew / corruption).
+        # Don't trust it; fall back to default so we don't show the banner
+        # with a nonsense timestamp. Boundary is ``>=`` to match the
+        # worker's ``elapsed < _MARKER_STALE_SECONDS`` check — at exactly
+        # 30 min, both treat the marker as stale.
+        if elapsed < 0 or elapsed >= _MARKER_STALE_SECONDS:
+            return default
+        sha = data.get('pre_pull_sha')
+        if not isinstance(sha, str) or not _SHA_RE.match(sha):
+            return default
+        banner = 'Update in progress — showing commits being installed.'
+        return (f'{sha}..origin/main', banner)
+
     def _load_commits(self) -> None:
-        """Run `git log HEAD..origin/main` and populate the list (newest first)."""
+        """Run ``git log <range>`` and populate the list (newest first)."""
+        range_spec, banner_text = self._compute_range()
+        if banner_text:
+            t = current_theme()
+            self._banner.setText(
+                f'<span style="color: {t.accent_orange}; font-style: italic;">'
+                f'{html.escape(banner_text)}</span>'
+            )
+            self._banner.setVisible(True)
         _sep = '\x1e'
         try:
             result = subprocess.run(
                 [
                     'git', 'log',
-                    'HEAD..origin/main',
+                    range_spec,
                     f'--format={_sep}%h%x00%H%x00%an%x00%ae%x00%ad%x00%ar%x00%s%x00%D%x00%b',
                     '--date=format:%a %b %d %H:%M:%S %Y %z',
                 ],

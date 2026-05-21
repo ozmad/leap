@@ -1,0 +1,43 @@
+# Spec-Driven Log: linux-compatibility
+
+## State
+Phase: implementation
+Created: 2026-05-13T00:00:00
+Last Updated: 2026-05-13T04:00:00
+Branch: feature/linux-compatibility
+
+---
+
+## Event Log
+<!-- Append-only. Never edit existing entries. -->
+
+[2026-05-13T00:00:00] [requirements] INIT — Task directory created. Slug: linux-compatibility
+[2026-05-13T00:01:00] [requirements] REQUIREMENTS_DRAFT — requirements.md created with 12 FRs, 5 NFRs, 10 SCs
+[2026-05-13T00:05:00] [requirements] REQUIREMENTS_REFINED — Expanded to full monitor support (not degraded); VS Code nav in scope; shell config to ~/.leap.zshrc; 21 FRs, 6 NFRs, 13 SCs
+[2026-05-13T00:11:00] [requirements] REQUIREMENTS_COMMITTED — Branch feature/linux-compatibility created; requirements.md committed (5c2a794)
+[2026-05-13T00:11:00] [plan] PLAN_STARTED — Moving to Phase 2
+[2026-05-13T00:15:00] [plan] DECISION — TD-1: use _HAS_COCOA sentinel (matching permissions.py pattern)
+[2026-05-13T00:15:00] [plan] DECISION — TD-2: sys.platform == 'darwin' guards only (not != linux)
+[2026-05-13T00:15:00] [plan] DECISION — TD-5: VS Code Linux nav via code --reuse-window + existing extension file trigger
+[2026-05-13T00:15:00] [plan] DECISION — TD-7: shell config to ~/.leap.zshrc, single source line in main rc
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 1_pyproject-markers.md (S)
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 2_pyobjc-import-guards.md (M)
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 3_sleep-guard-linux.md (S)
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 4_clipboard-linux.md (S)
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 5_navigation-linux.md (M)
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 6_notifications-linux.md (S)
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 7_shell-config.md (M)
+[2026-05-13T00:20:00] [plan] SUBTASK_CREATED — 8_makefile-linux.md (M)
+[2026-05-13T00:30:00] [implementation] IMPL_STARTED — subtask 1: pyproject-markers
+[2026-05-13T00:30:00] [implementation] IMPL_DONE — subtask 1: added sys_platform=='darwin' markers to pyobjc-* (3), gnureadline, py2app; lockfile regenerated; test_pyproject_markers.py added; 410 tests pass, 35 pre-existing monitor import failures unaffected
+[2026-05-13T00:40:00] [implementation] IMPL_STARTED — subtask 2: pyobjc-import-guards
+[2026-05-13T00:45:00] [implementation] IMPL_DONE — subtask 2: try/except ImportError guards in app.py, navigation.py, pr_display_mixin.py, notifications_dialog.py; _HAS_COCOA + _HAS_NOTIFICATIONS sentinels; 12 new tests (both branches); 647 unit tests pass
+[2026-05-13T00:50:00] [implementation] IMPL_STARTED — subtask 3: sleep-guard-linux
+[2026-05-13T01:00:00] [implementation] IMPL_DONE — subtask 3: SleepGuard uses systemd-inhibit on Linux; LidCloseGuard uses systemd-inhibit --what=sleep on Linux; both no-op gracefully when absent; 10 new tests all branches; 657 unit tests pass: 3 new NFRs (narrow guards, both-branches, sentinel integrity), macOS non-regression SCs 13-17, unit test SCs 18-23 covering platform imports/sleep/clipboard/navigation/shell-config/pyproject markers
+[2026-05-13T02:00:00] [implementation] IMPL_STARTED — subtask 4: clipboard-linux
+[2026-05-13T02:30:00] [implementation] IMPL_DONE — subtask 4: image_handler.py xclip→xsel→None Linux paths for check_clipboard_has_image/save_clipboard_image; _copy_to_clipboard() helper in navigation.py replacing both pbcopy call sites; 15 new tests; 672 unit tests pass. DECISION: save_clipboard_image() refactored to hash-then-write approach (removed tmp file dance on Linux path for simplicity). server.py has no write-to-clipboard path; no change needed.
+[2026-05-13T02:30:00] [implementation] IMPL_STARTED — subtask 5: navigation-linux
+[2026-05-13T03:00:00] [implementation] IMPL_DONE — subtask 5: _navigate_vscode() Linux path with code/cursor --reuse-window; _navigate_iterm2/terminal_app/arduino/jetbrains early-return False on Linux; _find_wezterm_cli() skips /Applications+mdfind on Linux; _activate_wezterm() Linux path with wmctrl→xdotool best-effort; _get_app_pid/_check_accessibility_trusted/_ensure_app_focused/_send_keystroke guarded with _HAS_COCOA; detect_supported_ide_for_move() Linux path checks PATH; 17 new tests; 689 unit tests pass. DECISION: _activate_wezterm() returns True on Linux even without focus tool (pane navigation already succeeded).
+[2026-05-13T03:15:00] [implementation] IMPL_DONE — subtask 6: _play_sound() uses QApplication.beep() on Linux; _setup_modern_notifications() early-returns if not _HAS_COCOA; _send_macos_notification() routes to _send_dbus_notification() on Linux; dbus optional (try/except ImportError + _HAS_DBUS sentinel); both NSAppearance blocks in app.py guarded with _HAS_COCOA; 689 tests pass (no new test file per subtask spec).
+[2026-05-13T03:30:00] [implementation] IMPL_DONE — subtask 7: configure-shell-helper.sh writes all config to ~/.leap.zshrc/~/.leap.bashrc, adds single idempotent source line to main rc, migrates legacy START/END block; 11 new tests; 700 unit tests pass. BUG_FIXED: basename of .leap.zshrc includes the leading dot, so grep check was ".leap.zshrc" not "..leap.zshrc".
+[2026-05-13T04:00:00] [implementation] IMPL_DONE — subtask 8: check-macos changed from exit-1 to info-only warning; BUILD_MONITOR_APP has Linux early exit; install-monitor has Linux early exit; .prompt-notifications skips on Linux; uninstall-monitor osascript wrapped in Darwin guard; configure_iterm2_csi_u.py exits 0 on non-Darwin; configure_wezterm_csi_u.py uses shutil.which on Linux (skips mdfind); 700 unit tests pass. All 8 subtasks complete.

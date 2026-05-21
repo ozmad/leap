@@ -4,13 +4,17 @@ import os
 from functools import partial
 from typing import Any, Optional
 
-from AppKit import NSBeep, NSSound
-from Foundation import NSURL
+try:
+    from AppKit import NSBeep, NSSound
+    from Foundation import NSURL
+    _HAS_NOTIFICATIONS = True
+except ImportError:  # pragma: no cover — non-macOS / missing pyobjc
+    _HAS_NOTIFICATIONS = False
 from PyQt5.QtCore import QEvent, Qt, QTimer
 from PyQt5.QtGui import QCursor, QFont
 from PyQt5.QtWidgets import (
-    QAction, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QGridLayout, QHBoxLayout, QLabel, QMenu, QVBoxLayout, QWidget,
+    QAction, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
+    QHBoxLayout, QLabel, QMenu, QPushButton, QVBoxLayout, QWidget,
 )
 
 from leap.monitor.dialogs.zoom_mixin import ZoomMixin
@@ -261,10 +265,17 @@ class NotificationsDialog(ZoomMixin, QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # Cancel bottom-left, OK bottom-right.
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        ok_btn = QPushButton('OK')
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
 
         self._init_zoom('notifications_font_size')
 
@@ -527,7 +538,7 @@ class NotificationsDialog(ZoomMixin, QDialog):
 
 
 def _play_sound(sound_name: str) -> None:
-    """Play a macOS system sound by name or file path.
+    """Play a system sound by name or file path (macOS and Linux).
 
     Args:
         sound_name: 'Default' for system alert, 'None' for silence,
@@ -535,18 +546,24 @@ def _play_sound(sound_name: str) -> None:
     """
     if sound_name == 'None':
         return
+    if _HAS_NOTIFICATIONS:
+        try:
+            if sound_name == 'Default':
+                NSBeep()
+            elif os.path.isabs(sound_name):
+                url = NSURL.fileURLWithPath_(sound_name)
+                sound = NSSound.alloc().initWithContentsOfURL_byReference_(url, True)
+                if sound:
+                    sound.play()
+            else:
+                sound = NSSound.soundNamed_(sound_name)
+                if sound:
+                    sound.play()
+        except Exception:
+            pass
+        return
+    # Linux: Qt system beep (best-effort)
     try:
-        if sound_name == 'Default':
-            NSBeep()
-        elif os.path.isabs(sound_name):
-            # Custom file path
-            url = NSURL.fileURLWithPath_(sound_name)
-            sound = NSSound.alloc().initWithContentsOfURL_byReference_(url, True)
-            if sound:
-                sound.play()
-        else:
-            sound = NSSound.soundNamed_(sound_name)
-            if sound:
-                sound.play()
+        QApplication.beep()
     except Exception:
-        pass  # PyObjC not available
+        pass

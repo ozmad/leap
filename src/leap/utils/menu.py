@@ -18,14 +18,39 @@ if TYPE_CHECKING:
 # Match "<digit>. <label>" (normal Ink TUI) OR "<digit>  <label>" with 2+
 # spaces (corruption: when overlapping pyte frames overwrite the cell that
 # held the period, the visible separator is just the cells that nothing
-# was redrawn into).  The "cursor garbage" group accepts one OR MORE
-# non-digit-non-space chars so prefixes like "❯s" (a stale "s" cell stuck
-# next to the cursor) still let the digit be extracted.
-# Single-space separators are deliberately rejected so phrases like
-# "1 file changed" / "12 minutes remaining" in conversational text do
-# NOT get parsed as menu options.
+# was redrawn into).  The leading "cursor/border garbage" group accepts
+# ZERO OR MORE clusters of non-digit-non-space chars (each optionally
+# separated by horizontal whitespace) so that:
+#   * "❯s" (a stale "s" cell stuck next to the cursor) still parses
+#   * "│ ❯ 1. Yes" (bordered Ink dialog: border + space + cursor + space
+#     + digit) parses — without this the SELECTED row of a bordered
+#     menu would silently drop out of the parsed options, while the
+#     unselected rows (single border cluster only) still parsed, so
+#     auto-approve could not find option 1's "Yes" and the dialog
+#     would sit indefinitely
+#   * "❯ ❯ 1. Yes" (double-cursor overdraw from re-rendered frames)
+#     parses
+# Single-space separators between digit and label are still rejected
+# so phrases like "1 file changed" / "12 minutes remaining" in
+# conversational text do NOT get parsed as menu options.  The
+# letters-only "Yes" check in auto-approve is the safety net for the
+# broader prefix: prose that does now parse as a menu option (e.g.
+# inline "The plan is: 1. read file") yields a label whose letters
+# don't reduce to "yes", so auto-approve still refuses to act on it.
+#
+# **Possessive quantifiers (`++`, `*+`) are required.**  The plain-`*`
+# form would catastrophically backtrack on no-match lines that contain
+# a mid-sentence period (e.g. "Claude has written up a plan. Would
+# you like to proceed?") — the regex engine explores exponentially
+# many ways to split the prefix into clusters before giving up.  The
+# possessive form commits each cluster greedily and never backtracks
+# into the prefix, so no-match lines fail in O(n) instead of hanging
+# the auto-sender thread.  Verified safe on Python 3.11+ (Leap's
+# minimum); earlier interpreters would silently re-introduce the
+# blowup since they treat `++` as a syntax error and fall back to
+# greedy — pyproject.toml's python = "^3.11" gate prevents that.
 MENU_OPTION_RE: re.Pattern[str] = re.compile(
-    r'\s*(?:[^\d\s]+\s*)?(\d+)(?:\.[^\w\n]+|[ \t]{2,})(.+)'
+    r'\s*(?:[^\d\s]++\s*+)*+(\d+)(?:\.[^\w\n]+|[ \t]{2,})(.+)'
 )
 
 

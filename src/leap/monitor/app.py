@@ -6,6 +6,7 @@ PyQt5-based GUI for viewing and managing active Leap sessions.
 
 import base64
 import faulthandler
+import json
 import logging
 import os
 from pathlib import Path
@@ -15,12 +16,16 @@ import sys
 import time
 from typing import Any, Optional
 
-import objc
-from AppKit import (
-    NSAppearance, NSApplication, NSEvent,
-    NSImage, NSKeyDownMask, NSWindowStyleMaskFullSizeContentView,
-)
-from Foundation import NSDate, NSMakeRect, NSRunLoop
+try:
+    import objc
+    from AppKit import (
+        NSAppearance, NSApplication, NSEvent,
+        NSImage, NSKeyDownMask, NSWindowStyleMaskFullSizeContentView,
+    )
+    from Foundation import NSDate, NSMakeRect, NSRunLoop
+    _HAS_COCOA = True
+except ImportError:  # pragma: no cover — non-macOS / missing pyobjc
+    _HAS_COCOA = False
 from PyQt5.QtWidgets import (
     QAction, QApplication, QComboBox, QDialog, QFrame, QInputDialog,
     QLineEdit, QMainWindow, QMenu, QScrollBar, QShortcut, QToolButton,
@@ -128,13 +133,46 @@ class UpdateCheckWorker(QThread):
     network hiccup never surfaces in the UI.
     """
 
+    # Skip the background fetch while a ``leap --update`` is in progress.
+    # Without this, our own auto-fetch races the update's ``git pull`` and
+    # produces ``cannot lock ref 'refs/remotes/origin/main'`` errors that
+    # surface to the user as a confusing "git pull failed". The retry
+    # loop in leap-update.sh is the safety net for races we can't see
+    # (IDE auto-fetch, manual `git fetch` in another terminal); this
+    # check eliminates the race source we *do* own. Stale-fallback in
+    # case phase 2 crashed without removing the marker.
+    _MARKER_REL_PATH = os.path.join('.storage', 'update_in_progress')
+    _MARKER_STALE_SECONDS = 30 * 60
+
     result_ready = pyqtSignal(int)
 
     def __init__(self, repo_path: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._repo_path = repo_path
 
+    def _update_in_progress(self) -> bool:
+        marker_path = os.path.join(self._repo_path, self._MARKER_REL_PATH)
+        try:
+            with open(marker_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return False
+        # Defensive: a non-dict root would AttributeError on .get(); reject
+        # bool because it's an int subclass and ``true`` would read as 1.
+        if not isinstance(data, dict):
+            return False
+        started_at = data.get('started_at')
+        if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
+            return False
+        elapsed = time.time() - float(started_at)
+        # Negative elapsed (clock skew / future timestamp) is treated as
+        # invalid — otherwise a bogus future timestamp would suppress all
+        # background fetches indefinitely.
+        return 0 <= elapsed < self._MARKER_STALE_SECONDS
+
     def run(self) -> None:
+        if self._update_in_progress():
+            return
         try:
             subprocess.run(
                 ['git', 'fetch', 'origin', '--quiet'],
@@ -2400,16 +2438,17 @@ class MonitorWindow(
         r = t.border_radius
 
         # Set macOS appearance (dark/light) — must come before palette
-        try:
-            appearance_name = (
-                'NSAppearanceNameDarkAqua' if t.is_dark
-                else 'NSAppearanceNameAqua'
-            )
-            appearance = NSAppearance.appearanceNamed_(appearance_name)
-            if appearance:
-                NSApplication.sharedApplication().setAppearance_(appearance)
-        except Exception:
-            pass
+        if _HAS_COCOA:
+            try:
+                appearance_name = (
+                    'NSAppearanceNameDarkAqua' if t.is_dark
+                    else 'NSAppearanceNameAqua'
+                )
+                appearance = NSAppearance.appearanceNamed_(appearance_name)
+                if appearance:
+                    NSApplication.sharedApplication().setAppearance_(appearance)
+            except Exception:
+                pass
 
         app = QApplication.instance()
 
@@ -3705,16 +3744,17 @@ def main() -> None:
 
     # Set macOS appearance based on theme (dark/light)
     t = current_theme()
-    try:
-        appearance_name = (
-            'NSAppearanceNameDarkAqua' if t.is_dark
-            else 'NSAppearanceNameAqua'
-        )
-        appearance = NSAppearance.appearanceNamed_(appearance_name)
-        if appearance:
-            NSApplication.sharedApplication().setAppearance_(appearance)
-    except Exception:
-        pass
+    if _HAS_COCOA:
+        try:
+            appearance_name = (
+                'NSAppearanceNameDarkAqua' if t.is_dark
+                else 'NSAppearanceNameAqua'
+            )
+            appearance = NSAppearance.appearanceNamed_(appearance_name)
+            if appearance:
+                NSApplication.sharedApplication().setAppearance_(appearance)
+        except Exception:
+            pass
 
     # Set app icon for Dock and macOS notifications
     icon_path = find_icon()

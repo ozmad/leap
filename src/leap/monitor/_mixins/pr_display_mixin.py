@@ -7,9 +7,19 @@ import os
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
-import objc
-from AppKit import NSApplication, NSImage
-from Foundation import NSDictionary, NSObject, NSSet, NSUserNotification, NSUserNotificationCenter
+try:
+    import objc
+    from AppKit import NSApplication, NSImage
+    from Foundation import NSDictionary, NSObject, NSSet, NSUserNotification, NSUserNotificationCenter
+    _HAS_COCOA = True
+except ImportError:  # pragma: no cover — non-macOS / missing pyobjc
+    _HAS_COCOA = False
+
+try:
+    import dbus as _dbus
+    _HAS_DBUS = True
+except ImportError:
+    _HAS_DBUS = False
 from PyQt5 import sip
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QLabel
@@ -52,6 +62,8 @@ def _setup_modern_notifications(monitor: MonitorWindow) -> None:
     and the legacy NSUserNotification path is used instead.
     """
     global _un_center, _un_ready
+    if not _HAS_COCOA:
+        return
     if _un_ready:
         return  # Already set up
     try:
@@ -462,6 +474,9 @@ class PRDisplayMixin(_Base):
                 When True, both "Server Terminal" and "Client Terminal"
                 buttons are shown.  When False, only "Terminal".
         """
+        if not _HAS_COCOA:
+            _send_dbus_notification(subtitle, body)
+            return
         if _un_ready:
             _send_modern_notification(subtitle, body, sound_name,
                                      tag, notif_type, has_client)
@@ -553,3 +568,19 @@ def _send_legacy_notification(subtitle: str, body: str, sound_name: str) -> None
             _play_sound(sound_name)
     except Exception:
         pass  # PyObjC not available or notification failed
+
+
+def _send_dbus_notification(title: str, body: str) -> None:
+    """Send a desktop notification via D-Bus (Linux, best-effort)."""
+    if not _HAS_DBUS:
+        return
+    try:
+        bus = _dbus.SessionBus()
+        notify = bus.get_object(
+            'org.freedesktop.Notifications',
+            '/org/freedesktop/Notifications',
+        )
+        iface = _dbus.Interface(notify, 'org.freedesktop.Notifications')
+        iface.Notify('Leap Monitor', 0, '', title, body, [], {}, 5000)
+    except Exception:
+        pass  # D-Bus not available or DE doesn't support it

@@ -1452,11 +1452,29 @@ class CLIStateTracker:
         # doesn't fire (e.g. /clear, /help).  2s is long enough that
         # brief streaming pauses don't false-trigger, but short enough
         # that /clear resolves quickly.  Disabled for Ratatui TUIs.
+        #
+        # Silence is measured from ``max(_last_output_time,
+        # _running_since)`` so that pre-RUNNING silence does not count.
+        # Without this baseline, answering an AskUserQuestion /
+        # permission dialog with Enter (which moves WAITING→RUNNING
+        # but does not refresh ``_last_output_time``) instantly trips
+        # the 5 s threshold off the silence accumulated while the
+        # dialog was on screen — the transcript guard can't help
+        # because the next assistant entry hasn't been written yet
+        # (the latest one is the OLD tool_use call at
+        # ``ts <= _running_since``) and the auto-sender would flush a
+        # queued message before Claude resumes producing output.
+        # Using the max preserves the hung-after-send case: once the
+        # baseline is ``_running_since``, a real 5 s / 60 s of
+        # post-transition silence still triggers the fallbacks.
+        silence_baseline = max(
+            self._last_output_time, self._running_since,
+        )
         if (
             current == CLIState.RUNNING
             and not self._provider.cursor_hidden_while_idle
-            and self._last_output_time > 0
-            and (self._clock() - self._last_output_time) > 5.0
+            and silence_baseline > 0
+            and (self._clock() - silence_baseline) > 5.0
         ):
             with self._screen_lock:
                 cursor_visible = not self._screen.cursor.hidden
@@ -1542,8 +1560,17 @@ class CLIStateTracker:
             if self._provider.silence_timeout is not None
             else SAFETY_SILENCE_TIMEOUT
         )
-        if current == CLIState.RUNNING and self._last_output_time > 0:
-            silence = self._clock() - self._last_output_time
+        # Same ``max(_last_output_time, _running_since)`` baseline as
+        # the cursor+silence path above — pre-RUNNING silence (e.g.
+        # from a long-deliberation dialog wait) must not count toward
+        # the safety timeout, or a 60 s+ dialog would force-idle the
+        # session the instant the user answers.  Hung-after-send is
+        # still covered: silence ticks from ``_running_since`` onward.
+        safety_baseline = max(
+            self._last_output_time, self._running_since,
+        )
+        if current == CLIState.RUNNING and safety_baseline > 0:
+            silence = self._clock() - safety_baseline
             if silence > silence_timeout:
                 with self._screen_lock:
                     running_indicator = self._screen_has_running_indicator()
@@ -1686,19 +1713,26 @@ class CLIStateTracker:
         renders, so cells from earlier frames bleed through).
 
         Preference order while in a prompt state:
-        1. Live screen, if it already contains the provider's dialog
-           indicator (Claude has rendered the dialog after reset).
+        1. Live screen, if it certainly contains a full dialog (Claude
+           has re-rendered the dialog after reset).  Uses the strict
+           ``is_dialog_certain`` check rather than the lenient
+           ``has_dialog_indicator`` — otherwise a stray footer fragment
+           like ``'…Esc to cancel'`` left over after reset would override
+           the captured snapshot with a near-empty screen, hiding the
+           menu options.  Hit on the trust folder dialog at startup, where
+           Claude doesn't re-render the menu rows after the reset.
         2. The snapshot captured at transition time (fallback for the
            moment between reset and Claude's first dialog bytes).
-        3. Live screen, if the snapshot is empty (covers the trust
-           dialog case where the snapshot was overwritten).
+        3. Live screen, if the snapshot is empty (defensive fallback
+           for paths that transitioned to a waiting state without
+           capturing one).
         """
         with self._screen_lock:
             snapshot = self._prompt_snapshot
             if self._state in WAITING_STATES:
                 live_lines = self._get_display_lines()
                 live_compact = ''.join(live_lines).replace(' ', '')
-                if self._provider.has_dialog_indicator(live_compact):
+                if self._provider.is_dialog_certain(live_compact):
                     snapshot = live_lines
                 elif not snapshot:
                     snapshot = live_lines

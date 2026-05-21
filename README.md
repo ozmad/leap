@@ -10,11 +10,11 @@ Run AI coding agents (Claude Code, Codex CLI, Cursor Agent, Gemini CLI) in any t
 - **Real-time GUI monitoring** — See all sessions, jump across IDEs and projects
 - **PR tracking** — GitLab & GitHub comment detection with `/leap` tag support
 - **Slack integration** — Bidirectional messaging between Slack and Leap sessions
-- **Prevent sleep while busy** — Mac stays awake until every session is idle (optional lid-close override)
+- **Prevent sleep while busy** — System stays awake until every session is idle (caffeinate on macOS, systemd-inhibit on Linux; optional lid-close override on macOS)
 
 ## Installation
 
-**Platform:** macOS (full support). Linux works for core queueing and Slack, but the Monitor GUI is macOS only.
+**Platform:** macOS and Linux (full support, including the Monitor GUI). On Linux, install monitor dependencies first with `make install-monitor-deps`; on macOS, `make install-monitor` builds and installs the native app.
 
 **Prerequisites:** Python 3.11+, and one or more AI CLIs: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor Agent](https://cursor.com/docs/cli/overview), [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 
@@ -59,7 +59,7 @@ leap --resume           # Pick a past Leap tag; for Claude, resumes in your curr
                         # (transcript is relocated automatically — no `cd` needed)
 ```
 
-The **Monitor** is a native macOS app installed alongside Leap. Just open it from your Applications folder or Spotlight to see all your sessions at a glance:
+The **Monitor** is a PyQt5 GUI that runs on both macOS and Linux. On macOS it installs as a native app (`make install-monitor`); on Linux run it directly with `make run-monitor`. See all your sessions at a glance:
 
 ![Leap Monitor](assets/leap-monitor.png)
 

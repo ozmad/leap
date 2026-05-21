@@ -1,20 +1,22 @@
-"""macOS sleep prevention.
+"""Sleep prevention for macOS and Linux.
 
 This module exposes two cooperating guards that the monitor activates
 together while any session is in ``RUNNING`` state:
 
 :class:`SleepGuard`
-    Spawns ``caffeinate -i -w <monitor-pid>`` to block idle sleep.
+    macOS: spawns ``caffeinate -i -w <monitor-pid>`` to block idle sleep.
     Self-cleans on parent death thanks to ``-w``; survives a crash.
+    Linux: spawns ``systemd-inhibit --what=idle ... sleep infinity``.
+    Best-effort — silently no-ops if ``systemd-inhibit`` is absent.
 
 :class:`LidCloseGuard`
-    Optional layer (gated by the second checkbox).  Calls
-    ``sudo pmset -a disablesleep 1/0`` via :class:`SudoManager` to
-    additionally block lid-close sleep.  ``disablesleep`` is a sticky
+    macOS: calls ``sudo pmset -a disablesleep 1/0`` via :class:`SudoManager`
+    to additionally block lid-close sleep.  ``disablesleep`` is a sticky
     kernel setting and can't be tied to a process lifetime, so we lean
     on a marker file (``.storage/disablesleep.marker``) to detect and
-    recover from a crashed-while-active state on the next monitor
-    startup.
+    recover from a crashed-while-active state on the next monitor startup.
+    Linux: spawns ``systemd-inhibit --what=sleep ... sleep infinity``.
+    Best-effort — silently no-ops if ``systemd-inhibit`` is absent.
 
 The :class:`SleepGuard` is idempotent: ``start()`` while already
 active and ``stop()`` while inactive are both no-ops.
@@ -22,7 +24,9 @@ active and ``stop()`` while inactive are both no-ops.
 
 import logging
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -53,28 +57,46 @@ class SleepGuard:
     _CAFFEINATE_PATH = '/usr/bin/caffeinate'
 
     def start(self) -> None:
-        """Spawn ``caffeinate -i -w <ppid>`` if not already running.
+        """Spawn the platform sleep-inhibitor if not already running.
 
-        ``caffeinate`` exits automatically when the monitor process
-        exits (``-w``), so the assertion is always released — even on
-        a hard crash or ``os._exit``.  Failure to spawn (binary
-        missing, permission denied) is logged once and swallowed; the
-        feature degrades to "checkbox does nothing" rather than
-        breaking the monitor.
+        macOS: ``caffeinate -i -w <pid>`` — exits automatically when the
+        monitor dies (``-w``), so the assertion is always released even on
+        a hard crash or ``os._exit``.
+
+        Linux: ``systemd-inhibit --what=idle ... sleep infinity`` — we hold
+        the child process; terminating it releases the inhibit lock.
+        Best-effort: if ``systemd-inhibit`` is absent the guard silently
+        no-ops rather than breaking the monitor.
+
+        Failure to spawn is logged once and swallowed in both cases.
         """
         if self.is_active:
             return
+        if sys.platform == 'darwin':
+            cmd = [self._CAFFEINATE_PATH, '-i', '-w', str(os.getpid())]
+        else:
+            inhibit = shutil.which('systemd-inhibit')
+            if not inhibit:
+                logger.debug("SleepGuard: systemd-inhibit not found, skipping")
+                return
+            cmd = [
+                inhibit,
+                '--what=idle',
+                '--who=LeapMonitor',
+                '--why=Leap session active',
+                '--mode=block',
+                'sleep', 'infinity',
+            ]
         try:
             self._proc = subprocess.Popen(
-                [self._CAFFEINATE_PATH, '-i', '-w', str(os.getpid())],
+                cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            logger.info(
-                "SleepGuard active (caffeinate pid=%d)", self._proc.pid)
+            logger.info("SleepGuard active (pid=%d)", self._proc.pid)
         except OSError:
-            logger.exception("Failed to spawn caffeinate")
+            logger.exception("Failed to spawn SleepGuard")
             self._proc = None
 
     def stop(self) -> None:
@@ -114,6 +136,8 @@ class LidCloseGuard:
 
     def __init__(self) -> None:
         self._active: bool = False
+        # Linux: holds the systemd-inhibit child process (analogous to SleepGuard._proc)
+        self._proc: Optional[subprocess.Popen] = None
 
     @property
     def is_active(self) -> bool:
@@ -128,11 +152,39 @@ class LidCloseGuard:
         return _DISABLESLEEP_MARKER.exists()
 
     def start(self, password: str) -> Tuple[bool, str]:
-        """Run ``pmset -a disablesleep 1``.
+        """Activate lid-close sleep prevention.
 
-        Idempotent — if we're already active, returns ``(True, '')``
-        without touching the system or sudo.
+        macOS: runs ``sudo pmset -a disablesleep 1``.  Idempotent — if
+        already active, returns ``(True, '')`` without touching the system.
+
+        Linux: spawns ``systemd-inhibit --what=sleep ... sleep infinity``.
+        Best-effort — returns ``(True, '')`` whether or not the binary is
+        present; ``password`` is ignored.
         """
+        if sys.platform != 'darwin':
+            if self._proc is not None and self._proc.poll() is None:
+                return True, ''
+            inhibit = shutil.which('systemd-inhibit')
+            if not inhibit:
+                logger.debug("LidCloseGuard: systemd-inhibit not found, skipping")
+                return True, ''
+            try:
+                self._proc = subprocess.Popen(
+                    [inhibit, '--what=sleep', '--who=LeapMonitor',
+                     '--why=Lid close disabled', '--mode=block',
+                     'sleep', 'infinity'],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._active = True
+                logger.info("LidCloseGuard active (systemd-inhibit pid=%d)",
+                            self._proc.pid)
+            except OSError:
+                logger.exception("Failed to spawn LidCloseGuard inhibitor")
+            return True, ''
+
+        # macOS path — unchanged
         if self._active:
             return True, ''
         rc, err = SudoManager.run(
@@ -150,13 +202,26 @@ class LidCloseGuard:
         return False, err
 
     def stop(self, password: str) -> Tuple[bool, str]:
-        """Run ``pmset -a disablesleep 0``.
+        """Deactivate lid-close sleep prevention.
 
-        Idempotent — if we're not active and no marker is present,
-        returns ``(True, '')`` without touching the system.  When the
-        marker IS present (recovery from a crashed previous run), we
-        invoke pmset even if ``self._active`` is False.
+        macOS: runs ``sudo pmset -a disablesleep 0``.  Invokes pmset even
+        when not ``_active`` if the marker file is present (crash recovery).
+
+        Linux: terminates the systemd-inhibit child if running.
+        ``password`` is ignored.
         """
+        if sys.platform != 'darwin':
+            proc, self._proc = self._proc, None
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2.0)
+                except (subprocess.TimeoutExpired, OSError):
+                    proc.kill()
+            self._active = False
+            return True, ''
+
+        # macOS path — unchanged
         if not self._active and not _DISABLESLEEP_MARKER.exists():
             return True, ''
         rc, err = SudoManager.run(
