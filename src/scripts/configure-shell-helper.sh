@@ -113,7 +113,7 @@ if ! grep -qF "$LEAP_RC_BASENAME" "$RC_FILE" 2>/dev/null; then
 fi
 
 # Step 7 — Report.
-if [ "$migrated" = true ]; then
+if [ "$stripped" = true ]; then
     echo -e "${GREEN}ℹ Migrated Leap config → $LEAP_RC${NC}"
 fi
 echo -e "${GREEN}✓ Leap shell config written to $LEAP_RC${NC}"
