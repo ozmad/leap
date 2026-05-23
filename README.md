@@ -14,7 +14,7 @@ Run AI coding agents (Claude Code, Codex CLI, Cursor Agent, Gemini CLI) in any t
 
 ## Installation
 
-**Platform:** macOS and Linux (full support, including the Monitor GUI). On Linux, install monitor dependencies first with `make install-monitor-deps`; on macOS, `make install-monitor` builds and installs the native app.
+**Platform:** macOS and Linux (full support, including the Monitor GUI). `make install-monitor` works on both platforms — on macOS it builds and installs a native `.app`; on Linux it installs a desktop entry so Leap Monitor appears in your app launcher.
 
 **Prerequisites:** Python 3.11+, and one or more AI CLIs: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor Agent](https://cursor.com/docs/cli/overview), [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 
@@ -59,7 +59,7 @@ leap --resume           # Pick a past Leap tag; for Claude, resumes in your curr
                         # (transcript is relocated automatically — no `cd` needed)
 ```
 
-The **Monitor** is a PyQt5 GUI that runs on both macOS and Linux. On macOS it installs as a native app (`make install-monitor`); on Linux run it directly with `make run-monitor`. See all your sessions at a glance:
+The **Monitor** is a PyQt5 GUI that runs on both macOS and Linux. `make install-monitor` installs it as a native app on macOS and as a desktop entry (app launcher + `leap-monitor` command) on Linux. See all your sessions at a glance:
 
 ![Leap Monitor](assets/leap-monitor.png)
 

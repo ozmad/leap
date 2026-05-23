@@ -77,8 +77,8 @@ poetry run pytest tests/ -v       # All tests with verbose output
 
 ```bash
 make install           # Install core + configure shell
-make install-monitor   # Build and install GUI app (macOS); prints skip message on Linux
-make install-monitor-deps  # Install monitor Python deps without building the app (Linux)
+make install-monitor   # Build and install GUI app (macOS native app; Linux desktop entry)
+make install-monitor-deps  # Install monitor Python deps only (no desktop entry)
 make install-slack-app # Install Slack integration + setup wizard
 make reconfigure       # Re-run per-machine integration steps (hooks + IDE/terminal/shell configures); skips deps, monitor, slack, git pull. Use after installing a new CLI/IDE/terminal post-Leap. Same target leap --reconfigure execs into.
 make test              # Run the full test suite (unit + integration)
