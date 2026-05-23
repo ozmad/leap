@@ -381,8 +381,15 @@ ifeq ($(UNAME),Darwin)
 	fi
 	@$(MAKE) .prompt-notifications
 else
-	@echo "$(YELLOW)ℹ Monitor app build requires macOS (py2app).$(NC)"
-	@echo "  Use 'make run-monitor' to launch from source on Linux."
+	@echo "$(PROMPT_PREFIX) Installing monitor dependencies..."
+	@$(ENSURE_POETRY2) && poetry install --no-root --with monitor
+	@chmod +x $(SCRIPTS_DIR)/install-monitor-linux.sh
+	@$(SCRIPTS_DIR)/install-monitor-linux.sh "$(REPO_PATH)"
+	@if [ ! -f "$(REPO_PATH)/.storage/leap_contexts.json" ]; then \
+		echo '{"default": "Please try to solve all the issues that are discussed in the following threads:"}' \
+			> "$(REPO_PATH)/.storage/leap_contexts.json"; \
+	fi
+	@echo "$(GREEN)✓ Monitor installed successfully!$(NC)"
 endif
 
 .PHONY: .prompt-notifications
@@ -522,6 +529,14 @@ update: .env
 		poetry install --no-root --with monitor || exit $$?; \
 		$(MAKE) .gen-codesign-cert || exit $$?; \
 		$(BUILD_MONITOR_APP) || exit $$?; \
+		echo "$(GREEN)✓ Monitor updated$(NC)"; \
+	elif [ -f "$$HOME/.local/share/applications/leap-monitor.desktop" ]; then \
+		echo ""; \
+		echo "$(PROMPT_PREFIX) Detected Leap Monitor installation (Linux)"; \
+		echo "$(PROMPT_PREFIX) Updating monitor dependencies and launcher..."; \
+		poetry install --no-root --with monitor || exit $$?; \
+		chmod +x $(SCRIPTS_DIR)/install-monitor-linux.sh; \
+		$(SCRIPTS_DIR)/install-monitor-linux.sh "$(REPO_PATH)" || exit $$?; \
 		echo "$(GREEN)✓ Monitor updated$(NC)"; \
 	elif [ -f "$(REPO_PATH)/.storage/.migration_had_monitor" ]; then \
 		echo ""; \
@@ -1003,6 +1018,10 @@ uninstall-monitor:
 	fi; \
 	if [ "$$REMOVED" = "no" ]; then \
 		echo "  Monitor app not found"; \
+	fi
+	@if [ "$$(uname)" != "Darwin" ]; then \
+		chmod +x $(SCRIPTS_DIR)/uninstall-monitor-linux.sh; \
+		$(SCRIPTS_DIR)/uninstall-monitor-linux.sh; \
 	fi
 	@rm -rf build .dist
 	@echo "$(GREEN)✓ Monitor uninstalled successfully!$(NC)"
